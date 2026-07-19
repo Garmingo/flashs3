@@ -1,0 +1,7 @@
+/target/
+/.data/
+**/__pycache__/
+**/.DS_Store
+*.swp
+.env
+credentials.json

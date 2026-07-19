@@ -1,0 +1,24 @@
+[package]
+name = "flash-s3-operator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Optional Kubernetes operator for FlashS3"
+
+[[bin]]
+name = "flash-s3-operator"
+path = "src/main.rs"
+
+[dependencies]
+flash-s3-common = { workspace = true }
+anyhow = { workspace = true }
+futures-util = { workspace = true }
+k8s-openapi = { workspace = true }
+kube = { workspace = true }
+schemars = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror = { workspace = true }
