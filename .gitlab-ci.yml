@@ -6,7 +6,9 @@
 #
 # Two Kaniko jobs build the engine and operator images in parallel and push
 # them to this project's GitLab Container Registry. Each image is tagged with
-# the release tag (e.g. v0.1.0) and with `latest`.
+# the release tag (e.g. v0.2.0) and with `latest`. The same tag is passed as
+# Docker build-arg VERSION so the Rust binaries report that version
+# (`--version` / startup logs).
 
 stages:
   - build
@@ -49,6 +51,7 @@ workflow:
       --cache-repo "$KANIKO_CACHE"
       --single-snapshot
       --snapshot-mode=redo
+      --build-arg "VERSION=$CI_COMMIT_TAG"
       --label "org.opencontainers.image.source=$CI_PROJECT_URL"
       --label "org.opencontainers.image.revision=$CI_COMMIT_SHA"
       --label "org.opencontainers.image.version=$CI_COMMIT_TAG"

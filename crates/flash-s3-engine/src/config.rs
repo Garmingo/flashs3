@@ -15,7 +15,11 @@ use flash_s3_common::{
 /// Every field can be set via `--flag` or the matching `FLASHS3_*` env var
 /// (see `flash_s3_common::env`).
 #[derive(Debug, Clone, Parser)]
-#[command(name = "flash-s3-engine", about = "FlashS3 autonomous S3 storage engine")]
+#[command(
+    name = "flash-s3-engine",
+    version = flash_s3_common::VERSION,
+    about = "FlashS3 autonomous S3 storage engine"
+)]
 pub struct Config {
     /// Local data directory (buckets, index, credentials).
     #[arg(long, env = ENV_DATA_DIR, default_value = "./.data")]

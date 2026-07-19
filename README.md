@@ -59,9 +59,11 @@ Release-Tags triggern GitLab CI (Kaniko) und pushen zwei Images in die Garmingo 
 Zusätzlich gibt es jeweils das Tag `latest`. Beispiel mit festem Release:
 
 ```text
-registry.garmingo.net/garmingo/flashs3/engine:v0.1.0
-registry.garmingo.net/garmingo/flashs3/operator:v0.1.0
+registry.garmingo.net/garmingo/flashs3/engine:v0.2.0
+registry.garmingo.net/garmingo/flashs3/operator:v0.2.0
 ```
+
+Release-Builds setzen die Binary-Version aus dem Git-Tag (`VERSION` build-arg → `CARGO_PKG_VERSION`). Tag `v0.2.0` → `flash-s3-engine --version` meldet `0.2.0`.
 
 ### Engine standalone (ohne Operator)
 
@@ -106,7 +108,7 @@ Das Operator-Deployment mountet das ServiceAccount-Token explizit (projected Vol
 Ohne dieses Mount scheitert `kube::Client::try_default()` mit
 `failed to read the default namespace`.
 
-In `deploy/operator/deployment.yaml` bei Bedarf `imagePullSecrets` aktivieren und das Image-Tag auf ein Release setzen (z. B. `…/operator:v0.1.0`).
+In `deploy/operator/deployment.yaml` bei Bedarf `imagePullSecrets` aktivieren und das Image-Tag auf ein Release setzen (z. B. `…/operator:v0.2.0`).
 
 ```bash
 kubectl -n flashs3-system rollout status deploy/flash-s3-operator

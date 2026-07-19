@@ -12,6 +12,7 @@ mod env;
 mod error;
 mod identity;
 mod policy;
+mod version;
 
 pub use acl::*;
 pub use cache::*;
@@ -19,3 +20,4 @@ pub use env::*;
 pub use error::*;
 pub use identity::*;
 pub use policy::*;
+pub use version::VERSION;

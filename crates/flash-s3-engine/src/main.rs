@@ -22,6 +22,7 @@ async fn main() -> anyhow::Result<()> {
 
     let config = Config::parse();
     tracing::info!(
+        version = flash_s3_common::VERSION,
         bind = %config.bind,
         data_dir = %config.data_dir.display(),
         "starting flash-s3-engine"

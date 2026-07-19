@@ -27,11 +27,11 @@ async fn main() -> anyhow::Result<()> {
         .json()
         .init();
 
+    tracing::info!(version = flash_s3_common::VERSION, "flash-s3-operator starting");
+
     let client = Client::try_default().await?;
     let buckets = Api::<FlashS3Bucket>::all(client.clone());
     let ctx = Arc::new(ContextData { client });
-
-    tracing::info!("flash-s3-operator starting");
 
     Controller::new(buckets, WatcherConfig::default())
         .run(reconcile, error_policy, ctx)
