@@ -1,10 +1,12 @@
 # FlashS3
 
-Minimalistische, hochperformante **S3-kompatible** Object-Storage-Engine in Rust.
+Minimal, high-performance **S3-compatible** object storage engine written in Rust.
 
-Die Kernanwendung `flash-s3-engine` ist vollständig autark: S3-HTTP, In-Memory-Cache (moka) und direktes Disk-I/O. Der Kubernetes-Operator ist optional.
+The core application, `flash-s3-engine`, is fully standalone: S3 HTTP, an in-memory
+[`moka`](https://github.com/moka-rs/moka) cache, and direct disk I/O. The Kubernetes
+operator is optional.
 
-## Quick start (lokal)
+## Quick start (local)
 
 ```bash
 export FLASHS3_DATA_DIR=./.data
@@ -20,7 +22,7 @@ aws --endpoint-url http://127.0.0.1:9000 s3 mb s3://demo
 aws --endpoint-url http://127.0.0.1:9000 s3 cp ./file.bin s3://demo/
 aws --endpoint-url http://127.0.0.1:9000 s3 cp s3://demo/file.bin ./out.bin
 
-# Public-read object (CDN)
+# Public-read object (for example, a CDN origin)
 aws --endpoint-url http://127.0.0.1:9000 s3api put-object-acl \
   --bucket demo --key file.bin --acl public-read
 curl -f http://127.0.0.1:9000/demo/file.bin -o /dev/null
@@ -30,42 +32,42 @@ Ops endpoints: `/healthz`, `/readyz`, `/metrics`.
 
 ## Workspace
 
-| Crate | Rolle |
+| Crate | Role |
 |-------|--------|
-| `flash-s3-common` | Shared Types (ACL, Policy, Errors, Env) |
-| `flash-s3-engine` | Autarke S3 Storage Engine |
-| `flash-s3-operator` | Optionaler kube-rs Operator (`FlashS3Bucket`) |
+| `flash-s3-common` | Shared types for ACLs, policies, errors, and environment variables |
+| `flash-s3-engine` | Standalone S3 storage engine |
+| `flash-s3-operator` | Optional kube-rs operator for `FlashS3Bucket` resources |
 
 ## Features
 
 - Path-style S3 API: Buckets, Objects, Multipart, CopyObject
 - SigV4 + Presigned URLs
-- Multi API-Keys (`credentials.json` unter Data-Dir)
-- Rich S3 ACLs (Bucket + Object, Canned + Grants)
-- Bucket Policies (Allow/Deny, Principal=Key, Prefix/Action)
-- Hybrid Cache: kleine Objekte write-through + moka Byte-LRU; große Objekte streamen
-- 4-Hex FS-Sharding (`aa/bb/<hash>/current/`)
-- Prometheus metrics, graceful shutdown, panic isolation
+- Multiple API keys (`credentials.json` in the data directory)
+- Rich S3 ACLs (bucket and object ACLs, canned ACLs, and grants)
+- Bucket policies (allow/deny, key principals, prefixes, and actions)
+- Hybrid cache: small objects are written through to disk and cached in moka's byte-LRU; large objects stream directly to disk
+- Four-hex filesystem sharding (`aa/bb/<hash>/current/`)
+- Prometheus metrics, graceful shutdown, and panic isolation
 
 ## Container images
 
-Release-Tags triggern GitLab CI (Kaniko) und pushen zwei Images in die Garmingo Registry:
+Release tags trigger GitLab CI (Kaniko), which publishes two images to the Garmingo registry:
 
-| Image | Pfad |
+| Image | Path |
 |-------|------|
 | Engine | `registry.garmingo.net/garmingo/flashs3/engine:<tag>` |
 | Operator | `registry.garmingo.net/garmingo/flashs3/operator:<tag>` |
 
-Zusätzlich gibt es jeweils das Tag `latest`. Beispiel mit festem Release:
+Both images also receive the `latest` tag. Example using a fixed release:
 
 ```text
 registry.garmingo.net/garmingo/flashs3/engine:v0.2.0
 registry.garmingo.net/garmingo/flashs3/operator:v0.2.0
 ```
 
-Release-Builds setzen die Binary-Version aus dem Git-Tag (`VERSION` build-arg → `CARGO_PKG_VERSION`). Tag `v0.2.0` → `flash-s3-engine --version` meldet `0.2.0`.
+Release builds set the binary version from the Git tag (`VERSION` build argument → `CARGO_PKG_VERSION`). A `v0.2.0` tag makes `flash-s3-engine --version` report `0.2.0`.
 
-### Engine standalone (ohne Operator)
+### Run the engine standalone (without the operator)
 
 ```bash
 docker pull registry.garmingo.net/garmingo/flashs3/engine:latest
@@ -77,24 +79,24 @@ docker run --rm -p 9000:9000 \
   registry.garmingo.net/garmingo/flashs3/engine:latest
 ```
 
-Private Registry: vorher einloggen (`docker login registry.garmingo.net`) bzw. im Cluster ein `imagePullSecret` setzen.
+For a private registry, authenticate first (`docker login registry.garmingo.net`) or configure an `imagePullSecret` in your cluster.
 
 ## Kubernetes Operator
 
-Der Operator reconciled `FlashS3Bucket`-CRs zu PVC + Secret + Deployment + Service.
+The operator reconciles `FlashS3Bucket` custom resources into a PVC, Secret, Deployment, and Service.
 
-### 1. CRD installieren
+### 1. Install the CRD
 
 ```bash
 kubectl apply -f deploy/crds/flashs3bucket.yaml
 ```
 
-### 2. Operator deployen
+### 2. Deploy the operator
 
 ```bash
 kubectl apply -f deploy/operator/rbac.yaml
 
-# Optional: Pull-Secret für registry.garmingo.net
+# Optional: pull secret for registry.garmingo.net
 kubectl create secret docker-registry garmingo-registry \
   --namespace flashs3-system \
   --docker-server=registry.garmingo.net \
@@ -104,18 +106,18 @@ kubectl create secret docker-registry garmingo-registry \
 kubectl apply -f deploy/operator/deployment.yaml
 ```
 
-Das Operator-Deployment mountet das ServiceAccount-Token explizit (projected Volume).
-Ohne dieses Mount scheitert `kube::Client::try_default()` mit
+The operator Deployment explicitly mounts the ServiceAccount token through a projected volume.
+Without this mount, `kube::Client::try_default()` fails with
 `failed to read the default namespace`.
 
-In `deploy/operator/deployment.yaml` bei Bedarf `imagePullSecrets` aktivieren und das Image-Tag auf ein Release setzen (z. B. `…/operator:v0.2.0`).
+If needed, enable `imagePullSecrets` in `deploy/operator/deployment.yaml` and pin the image to a release tag (for example, `…/operator:v0.2.0`).
 
 ```bash
 kubectl -n flashs3-system rollout status deploy/flash-s3-operator
 kubectl -n flashs3-system logs -l app.kubernetes.io/name=flash-s3-operator -f
 ```
 
-### 3. Bucket anlegen
+### 3. Create a bucket
 
 ```bash
 kubectl apply -f deploy/examples/bucket.yaml
@@ -123,7 +125,7 @@ kubectl get flashs3buckets
 kubectl get svc,pvc,deploy -l app.kubernetes.io/managed-by=flash-s3-operator
 ```
 
-Beispiel-CR (`deploy/examples/bucket.yaml`):
+Example custom resource (`deploy/examples/bucket.yaml`):
 
 ```yaml
 apiVersion: storage.flashs3.io/v1alpha1
@@ -146,7 +148,7 @@ spec:
   retainPvc: true
 ```
 
-Credentials: ohne `spec.auth.secretRef` erzeugt der Operator ein Secret mit Root-Keys. Endpoint danach z. B. `http://media.default.svc:9000`.
+Credentials: if `spec.auth.secretRef` is omitted, the operator creates a Secret containing root keys. The resulting endpoint is, for example, `http://media.default.svc:9000`.
 
 ## Env
 
@@ -157,8 +159,8 @@ Credentials: ohne `spec.auth.secretRef` erzeugt der Operator ein Secret mit Root
 | `FLASHS3_CACHE_POLICY` | `InMemoryLRU` |
 | `FLASHS3_CACHE_MAX_BYTES` | `268435456` |
 | `FLASHS3_CACHE_OBJECT_MAX_BYTES` | `4194304` |
-| `FLASHS3_ACCESS_KEY` / `FLASHS3_SECRET_KEY` | Bootstrap Root-Key |
-| `FLASHS3_CREDENTIALS_KEY` | optional — encrypts secrets in `credentials.json` (AES-256-GCM); unset = plaintext |
+| `FLASHS3_ACCESS_KEY` / `FLASHS3_SECRET_KEY` | Bootstrap root key |
+| `FLASHS3_CREDENTIALS_KEY` | Optional — encrypts secrets in `credentials.json` (AES-256-GCM); plaintext when unset |
 | `FLASHS3_REGION` | `us-east-1` |
 | `FLASHS3_DEFAULT_OBJECT_ACL` | `private` |
 
