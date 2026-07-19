@@ -1,3 +1,8 @@
+//! HTTP / S3 API layer (Axum).
+//!
+//! Path-style routing: `/{bucket}` and `/{bucket}/{key…}` plus ops endpoints
+//! `/healthz`, `/readyz`, `/metrics`.
+
 mod error;
 mod router;
 mod xml;

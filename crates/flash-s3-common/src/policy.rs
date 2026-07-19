@@ -1,14 +1,23 @@
+//! Minimal S3-compatible bucket policy model (JSON).
+//!
+//! Used for MinIO/Hetzner-style permission parity. Conditions are accepted in
+//! the document but not fully evaluated yet (prefix/action/principal matching
+//! is the MVP).
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// Minimal S3-compatible bucket policy document.
+/// Bucket policy document (`PutBucketPolicy` body).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct BucketPolicy {
+    /// Policy language version (default `2012-10-17`).
     #[serde(default = "default_version")]
     pub version: String,
+    /// Optional policy id.
     #[serde(default)]
     pub id: Option<String>,
+    /// Ordered statements; Deny wins over Allow when both match.
     pub statement: Vec<PolicyStatement>,
 }
 
@@ -16,37 +25,52 @@ fn default_version() -> String {
     "2012-10-17".to_string()
 }
 
+/// One Allow/Deny statement inside a [`BucketPolicy`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct PolicyStatement {
+    /// Optional statement id.
     #[serde(default)]
     pub sid: Option<String>,
+    /// Allow or Deny.
     pub effect: PolicyEffect,
+    /// Who the statement applies to (`*` or AWS principal map).
     pub principal: PolicyPrincipal,
+    /// Action(s), e.g. `s3:GetObject` or `s3:*`.
     pub action: StringOrVec,
+    /// Resource ARN(s), e.g. `arn:aws:s3:::bucket/*`.
     pub resource: StringOrVec,
+    /// Optional condition block (parsed, not fully evaluated in MVP).
     #[serde(default)]
     pub condition: Option<Value>,
 }
 
+/// Statement effect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub enum PolicyEffect {
+    /// Explicit allow.
     Allow,
+    /// Explicit deny (takes precedence).
     Deny,
 }
 
+/// Principal field: bare `"*"` or `{ "AWS": "…" }`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum PolicyPrincipal {
+    /// Typically `"*"`.
     Star(String),
+    /// AWS-style principal map.
     Map {
+        /// Access key, ARN, or `"*"`.
         #[serde(rename = "AWS")]
         aws: StringOrVec,
     },
 }
 
 impl PolicyPrincipal {
+    /// Whether this principal matches the request's access key (if any).
     pub fn matches(&self, access_key: Option<&str>) -> bool {
         match self {
             Self::Star(s) => s == "*",
@@ -67,14 +91,18 @@ impl PolicyPrincipal {
     }
 }
 
+/// JSON field that may be a single string or an array of strings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum StringOrVec {
+    /// Single value.
     One(String),
+    /// Multiple values.
     Many(Vec<String>),
 }
 
 impl StringOrVec {
+    /// Flatten to a list of string slices for matching.
     pub fn as_slice(&self) -> Vec<&str> {
         match self {
             Self::One(s) => vec![s.as_str()],
@@ -82,6 +110,7 @@ impl StringOrVec {
         }
     }
 
+    /// True if any pattern matches `value` with [`wildcard_match`].
     pub fn matches_any(&self, value: &str) -> bool {
         self.as_slice()
             .into_iter()
@@ -120,6 +149,7 @@ pub fn wildcard_match(pattern: &str, value: &str) -> bool {
 }
 
 impl BucketPolicy {
+    /// Parse policy JSON, tolerating lowercase field names.
     pub fn parse_json(raw: &str) -> Result<Self, crate::FlashError> {
         if let Ok(p) = serde_json::from_str::<Self>(raw) {
             return Ok(p);
@@ -130,8 +160,12 @@ impl BucketPolicy {
         serde_json::from_value(normalized).map_err(|_| crate::FlashError::MalformedPolicy)
     }
 
-    /// Evaluate policy for an action/resource. Returns Some(true/false) if a matching
-    /// statement decides, or None if no statement matched.
+    /// Evaluate policy for an action/resource.
+    ///
+    /// Returns:
+    /// - `Some(false)` if any matching statement Denies
+    /// - `Some(true)` if at least one matching statement Allows (and none Deny)
+    /// - `None` if no statement matched (caller falls through to ACLs)
     pub fn evaluate(
         &self,
         action: &str,
@@ -165,6 +199,7 @@ impl BucketPolicy {
     }
 }
 
+/// Normalize common lowercase JSON keys to PascalCase for serde.
 fn normalize_policy_json(mut v: Value) -> Value {
     if let Value::Object(map) = &mut v {
         rename_key(map, "version", "Version");
@@ -208,5 +243,74 @@ mod tests {
         assert!(wildcard_match("s3:Get*", "s3:GetObject"));
         assert!(wildcard_match("arn:aws:s3:::b/*", "arn:aws:s3:::b/foo"));
         assert!(!wildcard_match("s3:PutObject", "s3:GetObject"));
+        assert!(wildcard_match("*", "anything"));
+        assert!(wildcard_match("s3:GetObject", "s3:GetObject"));
+    }
+
+    #[test]
+    fn parse_and_evaluate_allow() {
+        let raw = r#"{
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": "*",
+                "Action": "s3:GetObject",
+                "Resource": "arn:aws:s3:::demo/*"
+            }]
+        }"#;
+        let p = BucketPolicy::parse_json(raw).unwrap();
+        assert_eq!(
+            p.evaluate("s3:GetObject", "arn:aws:s3:::demo/a.txt", None),
+            Some(true)
+        );
+        assert_eq!(
+            p.evaluate("s3:PutObject", "arn:aws:s3:::demo/a.txt", None),
+            None
+        );
+    }
+
+    #[test]
+    fn deny_overrides_allow() {
+        let raw = r#"{
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": { "AWS": "*" },
+                    "Action": "s3:*",
+                    "Resource": "arn:aws:s3:::demo/*"
+                },
+                {
+                    "Effect": "Deny",
+                    "Principal": { "AWS": "alice" },
+                    "Action": "s3:DeleteObject",
+                    "Resource": "arn:aws:s3:::demo/*"
+                }
+            ]
+        }"#;
+        let p = BucketPolicy::parse_json(raw).unwrap();
+        assert_eq!(
+            p.evaluate("s3:DeleteObject", "arn:aws:s3:::demo/x", Some("alice")),
+            Some(false)
+        );
+        assert_eq!(
+            p.evaluate("s3:GetObject", "arn:aws:s3:::demo/x", Some("alice")),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn principal_arn_suffix_match() {
+        let principal = PolicyPrincipal::Map {
+            aws: StringOrVec::One("arn:flashs3:iam:::user/flash".into()),
+        };
+        assert!(principal.matches(Some("flash")));
+        assert!(!principal.matches(Some("other")));
+    }
+
+    #[test]
+    fn lowercase_json_normalized() {
+        let raw = r#"{"version":"2012-10-17","statement":[{"effect":"allow","principal":"*","action":"s3:GetObject","resource":"arn:aws:s3:::b/*"}]}"#;
+        let p = BucketPolicy::parse_json(raw).unwrap();
+        assert_eq!(p.evaluate("s3:GetObject", "arn:aws:s3:::b/k", None), Some(true));
     }
 }

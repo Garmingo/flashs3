@@ -1,3 +1,9 @@
+//! `flash-s3-operator` — optional Kubernetes controller for [`FlashS3Bucket`].
+//!
+//! Watches the CRD and reconciles PVC + Secret + Deployment + Service so the
+//! autonomous `flash-s3-engine` runs with a mounted volume. Contains no storage
+//! business logic.
+
 mod crd;
 mod reconcile;
 
@@ -40,6 +46,7 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Requeue failed reconciles after a short backoff.
 fn error_policy(_obj: Arc<FlashS3Bucket>, error: &Error, _ctx: Arc<ContextData>) -> Action {
     tracing::warn!(error = %error, "requeue after error");
     Action::requeue(std::time::Duration::from_secs(15))

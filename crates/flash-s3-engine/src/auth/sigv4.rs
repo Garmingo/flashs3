@@ -1,3 +1,9 @@
+//! AWS Signature Version 4 verification (header auth + presigned query).
+//!
+//! Supports both `Authorization: AWS4-HMAC-SHA256 …` and query-string
+//! presigned URLs (`X-Amz-Signature`, …). Payload hashing follows the
+//! `x-amz-content-sha256` header when present.
+
 use std::collections::BTreeMap;
 
 use hmac::{Hmac, Mac};
@@ -11,11 +17,19 @@ use super::credentials::{CredentialStore, StoredKey};
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// Successful SigV4 authentication result.
 #[derive(Debug, Clone)]
 pub struct AuthResult {
+    /// Resolved credential used to sign the request.
     pub key: StoredKey,
 }
 
+/// Verify SigV4 for an incoming request.
+///
+/// Returns:
+/// - `Ok(Some(_))` when a valid signature was present
+/// - `Ok(None)` when the request is anonymous (no auth material)
+/// - `Err(_)` on malformed or invalid signatures
 pub fn verify_request(
     method: &str,
     path: &str,
@@ -234,6 +248,7 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
     mac.finalize().into_bytes().to_vec()
 }
 
+/// Hex-encoded SHA-256 of the request payload (SigV4 payload hash).
 pub fn hash_payload(body: &[u8]) -> String {
     hex::encode(Sha256::digest(body))
 }

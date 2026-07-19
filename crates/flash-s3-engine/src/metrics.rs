@@ -1,26 +1,41 @@
+//! Prometheus metrics registry for cache, disk I/O, and S3 request counters.
+
 use std::sync::Arc;
 
 use prometheus::{
-    Encoder, IntCounter, IntCounterVec, IntGauge, Opts, Registry, TextEncoder, HistogramOpts,
-    HistogramVec,
+    Encoder, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, Opts, Registry,
+    TextEncoder,
 };
 
+/// Process-wide metrics handle (cheap to clone).
 #[derive(Clone)]
 pub struct Metrics {
+    /// Registry used by `/metrics`.
     pub registry: Arc<Registry>,
+    /// Cache hit counter.
     pub cache_hits: IntCounter,
+    /// Cache miss counter.
     pub cache_misses: IntCounter,
+    /// Approximate weighted cache bytes.
     pub cache_bytes: IntGauge,
+    /// Number of cached entries.
     pub cache_entries: IntGauge,
+    /// Cumulative bytes read from disk.
     pub disk_read_bytes: IntCounter,
+    /// Cumulative bytes written to disk.
     pub disk_write_bytes: IntCounter,
+    /// Disk op latency histogram (`op` label).
     pub disk_op_duration: HistogramVec,
+    /// S3 request counter (`method`, `status`, `op`).
     pub s3_requests: IntCounterVec,
+    /// In-flight multipart uploads.
     pub multipart_inflight: IntGauge,
+    /// Caught panics in request handlers.
     pub panics: IntCounter,
 }
 
 impl Metrics {
+    /// Register all FlashS3 collectors on a fresh registry.
     pub fn new() -> anyhow::Result<Self> {
         let registry = Registry::new();
 
@@ -90,6 +105,7 @@ impl Metrics {
         })
     }
 
+    /// Encode all metrics as Prometheus text exposition format.
     pub fn gather(&self) -> anyhow::Result<String> {
         let families = self.registry.gather();
         let mut buffer = Vec::new();

@@ -1,3 +1,8 @@
+//! Reconcile loop: map a [`FlashS3Bucket`] CR to Kubernetes objects.
+//!
+//! Creates/updates PVC, credentials Secret, single-replica Deployment, and
+//! Service. On delete, removes Deployment/Service and optionally the PVC.
+
 use std::sync::Arc;
 
 use flash_s3_common::{
@@ -23,20 +28,27 @@ use crate::crd::FlashS3Bucket;
 
 const FINALIZER: &str = "flashs3.io/finalizer";
 
+/// Shared controller context (Kubernetes API client).
 pub struct ContextData {
+    /// Default kube client for the operator pod.
     pub client: Client,
 }
 
+/// Reconcile errors surfaced to the controller runtime.
 #[derive(Debug, Error)]
 pub enum Error {
+    /// Underlying kube-rs / API error.
     #[error("kube error: {0}")]
     Kube(#[from] kube::Error),
+    /// CR without namespace (should not happen for namespaced resources).
     #[error("missing namespace")]
     MissingNamespace,
+    /// Catch-all for finalizer / apply failures.
     #[error("{0}")]
     Other(String),
 }
 
+/// Controller entrypoint: apply or cleanup under a finalizer.
 pub async fn reconcile(obj: Arc<FlashS3Bucket>, ctx: Arc<ContextData>) -> Result<Action, Error> {
     let ns = obj.namespace().ok_or(Error::MissingNamespace)?;
     let api: Api<FlashS3Bucket> = Api::namespaced(ctx.client.clone(), &ns);

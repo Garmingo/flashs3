@@ -1,3 +1,9 @@
+//! Path-style S3 request router and handlers.
+//!
+//! A single catch-all dispatches on HTTP method + query flags (`acl`, `policy`,
+//! `uploads`, `uploadId`, …) to keep Axum routing simple while covering the
+//! S3 API surface we implement.
+
 use std::collections::BTreeMap;
 
 use axum::body::Body;
@@ -21,6 +27,10 @@ use crate::auth::{hash_payload, verify_request, AuthContext, S3Action};
 use crate::server::AppState;
 use crate::storage::PutObjectOpts;
 
+/// Build the Axum router with health/metrics and the S3 catch-all.
+///
+/// Includes [`CatchPanicLayer`] so a handler panic becomes HTTP 500 instead of
+/// killing the process.
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))

@@ -1,7 +1,10 @@
+//! S3 XML error responses and escaping helpers.
+
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use flash_s3_common::FlashError;
 
+/// Build a standard S3 `<Error>` XML response for `err`.
 pub fn s3_error_response(err: FlashError, resource: &str, request_id: &str) -> Response {
     let status = StatusCode::from_u16(err.http_status()).unwrap_or(StatusCode::BAD_REQUEST);
     let body = format!(
@@ -25,6 +28,7 @@ pub fn s3_error_response(err: FlashError, resource: &str, request_id: &str) -> R
         .into_response()
 }
 
+/// Escape XML special characters in element text.
 pub fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -33,9 +37,13 @@ pub fn xml_escape(s: &str) -> String {
         .replace('\'', "&apos;")
 }
 
+/// Axum-friendly error wrapper (used sparingly; most handlers return `FlashError`).
 pub struct ApiError {
+    /// Underlying Flash/S3 error.
     pub err: FlashError,
+    /// Request resource path for the XML body.
     pub resource: String,
+    /// Correlation id echoed to the client.
     pub request_id: String,
 }
 

@@ -1,8 +1,14 @@
+//! Minimal hand-rolled S3 XML serializers/parsers for responses we support.
+//!
+//! Avoiding a heavy schema stack keeps the binary small; parsers are intentionally
+//! tolerant rather than fully XSD-compliant.
+
 use flash_s3_common::{AccessControlPolicy, Grantee, GroupUri};
 
 use super::error::xml_escape;
 use crate::storage::{BucketInfo, IndexEntry};
 
+/// `ListAllMyBucketsResult` body.
 pub fn list_buckets_xml(buckets: &[BucketInfo], owner_id: &str, owner_name: &str) -> String {
     let mut body = String::from(
         r#"<?xml version="1.0" encoding="UTF-8"?><ListAllMyBucketsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">"#,
@@ -23,6 +29,7 @@ pub fn list_buckets_xml(buckets: &[BucketInfo], owner_id: &str, owner_name: &str
     body
 }
 
+/// `ListBucketResult` body (ListObjectsV2-shaped).
 pub fn list_objects_v2_xml(
     bucket: &str,
     prefix: &str,
@@ -58,6 +65,7 @@ pub fn list_objects_v2_xml(
     body
 }
 
+/// `AccessControlPolicy` XML for GetBucketAcl / GetObjectAcl.
 pub fn acl_xml(acl: &AccessControlPolicy) -> String {
     let mut body = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?><AccessControlPolicy xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Owner><ID>{}</ID><DisplayName>{}</DisplayName></Owner><AccessControlList>"#,
@@ -90,6 +98,7 @@ pub fn acl_xml(acl: &AccessControlPolicy) -> String {
     body
 }
 
+/// Best-effort ACL XML parser for PutBucketAcl / PutObjectAcl bodies.
 pub fn parse_acl_xml(raw: &str, fallback_owner: &AccessControlPolicy) -> Result<AccessControlPolicy, flash_s3_common::FlashError> {
     // Minimal parser for grants; if parse fails, return MalformedAcl
     let mut grants = Vec::new();
@@ -167,6 +176,7 @@ fn extract_block(xml: &str, tag: &str) -> Option<String> {
     Some(xml[i..j].to_string())
 }
 
+/// `InitiateMultipartUploadResult` body.
 pub fn initiate_multipart_xml(bucket: &str, key: &str, upload_id: &str) -> String {
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?><InitiateMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Bucket>{}</Bucket><Key>{}</Key><UploadId>{}</UploadId></InitiateMultipartUploadResult>"#,
@@ -176,6 +186,7 @@ pub fn initiate_multipart_xml(bucket: &str, key: &str, upload_id: &str) -> Strin
     )
 }
 
+/// `CompleteMultipartUploadResult` body.
 pub fn complete_multipart_xml(bucket: &str, key: &str, etag: &str) -> String {
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?><CompleteMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Location>/{}/{}</Location><Bucket>{}</Bucket><Key>{}</Key><ETag>{}</ETag></CompleteMultipartUploadResult>"#,
@@ -187,6 +198,7 @@ pub fn complete_multipart_xml(bucket: &str, key: &str, etag: &str) -> String {
     )
 }
 
+/// `ListPartsResult` body.
 pub fn list_parts_xml(bucket: &str, key: &str, upload_id: &str, parts: &[(i32, String, u64)]) -> String {
     let mut body = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?><ListPartsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Bucket>{}</Bucket><Key>{}</Key><UploadId>{}</UploadId><IsTruncated>false</IsTruncated>"#,
@@ -206,6 +218,7 @@ pub fn list_parts_xml(bucket: &str, key: &str, upload_id: &str, parts: &[(i32, S
     body
 }
 
+/// Parse `CompleteMultipartUpload` XML into `(part_number, etag)` pairs.
 pub fn parse_complete_multipart(xml: &str) -> Result<Vec<(i32, String)>, flash_s3_common::FlashError> {
     let mut parts = Vec::new();
     let mut rest = xml;

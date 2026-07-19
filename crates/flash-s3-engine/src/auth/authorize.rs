@@ -1,38 +1,57 @@
+//! Authorization: bucket policies first, then classic S3 ACLs.
+//!
+//! Evaluation order (see plan):
+//! 1. Policy Deny
+//! 2. Policy Allow
+//! 3. ACL grants (object then bucket)
+//! 4. Default Deny
+//!
+//! Root keys may bypass when [`Authorizer::root_bypasses`] is true.
+
 use flash_s3_common::{AccessControlPolicy, BucketPolicy, CanonicalUserId, FlashError, Permission};
 
 use super::credentials::StoredKey;
 use crate::storage::{BucketInfo, ObjectMeta};
 
+/// Authenticated (or anonymous) caller for a single request.
 #[derive(Debug, Clone)]
 pub struct AuthContext {
+    /// Present when SigV4 succeeded.
     pub key: Option<StoredKey>,
 }
 
 impl AuthContext {
+    /// Anonymous (unsigned) caller.
     pub fn anonymous() -> Self {
         Self { key: None }
     }
 
+    /// Caller authenticated with `key`.
     pub fn authenticated(key: StoredKey) -> Self {
         Self { key: Some(key) }
     }
 
+    /// True when SigV4 produced a key.
     pub fn is_authenticated(&self) -> bool {
         self.key.is_some()
     }
 
+    /// True for root/bootstrap credentials.
     pub fn is_root(&self) -> bool {
         self.key.as_ref().is_some_and(|k| k.is_root)
     }
 
+    /// Access key id for policy principal matching.
     pub fn access_key(&self) -> Option<&str> {
         self.key.as_ref().map(|k| k.access_key.as_str())
     }
 
+    /// Canonical user id for ACL checks.
     pub fn canonical_id(&self) -> Option<&CanonicalUserId> {
         self.key.as_ref().map(|k| &k.canonical_id)
     }
 
+    /// Display name or `"anonymous"`.
     pub fn display_name(&self) -> &str {
         self.key
             .as_ref()
@@ -41,6 +60,7 @@ impl AuthContext {
     }
 }
 
+/// Logical S3 action used for policy action strings and ACL permission mapping.
 #[derive(Debug, Clone, Copy)]
 pub enum S3Action {
     ListBuckets,
@@ -61,6 +81,7 @@ pub enum S3Action {
 }
 
 impl S3Action {
+    /// IAM-style action string, e.g. `s3:GetObject`.
     pub fn as_policy_action(self) -> &'static str {
         match self {
             Self::ListBuckets => "s3:ListAllMyBuckets",
@@ -81,6 +102,7 @@ impl S3Action {
         }
     }
 
+    /// ACL permission bit required for this action, if ACL-governed.
     pub fn acl_permission(self) -> Option<Permission> {
         match self {
             Self::GetObject | Self::ListBucket | Self::HeadBucket => Some(Permission::Read),
@@ -92,12 +114,16 @@ impl S3Action {
     }
 }
 
+/// Policy + ACL decision engine.
 pub struct Authorizer {
+    /// When true, `is_root` keys skip ACL/policy checks.
     pub root_bypasses: bool,
+    /// Reserved for stricter anonymous handling.
     pub auth_required: bool,
 }
 
 impl Authorizer {
+    /// Authorize service-level ops (ListBuckets / CreateBucket).
     pub fn check_service(&self, ctx: &AuthContext, action: S3Action) -> Result<(), FlashError> {
         if matches!(
             action,
@@ -114,6 +140,7 @@ impl Authorizer {
         Ok(())
     }
 
+    /// Authorize a bucket/object action for `ctx`.
     pub fn authorize(
         &self,
         ctx: &AuthContext,
@@ -197,6 +224,7 @@ impl Authorizer {
         Err(FlashError::AccessDenied)
     }
 
+    /// Ensure the caller may replace an ACL (owner or `WRITE_ACP`).
     pub fn ensure_can_set_acl(
         &self,
         ctx: &AuthContext,

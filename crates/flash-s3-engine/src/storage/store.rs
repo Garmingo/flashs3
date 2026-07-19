@@ -1,4 +1,9 @@
-use std::path::{Path, PathBuf}; // PathBuf used by ObjectStore
+//! Disk-backed object store: buckets, objects, multipart, ACLs, policies.
+//!
+//! All mutating object paths take a per-`(bucket,key)` async mutex and write
+//! via temp file + `fsync` + `rename` for crash-safe puts.
+
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -19,38 +24,63 @@ use crate::metrics::Metrics;
 use crate::storage::index::{IndexEntry, ObjectIndex};
 use crate::storage::layout;
 
+/// Persisted bucket metadata (`bucket.json`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BucketInfo {
+    /// Bucket name.
     pub name: String,
+    /// Creation timestamp (RFC3339).
     pub created: String,
+    /// Owning canonical user id.
     pub owner: CanonicalUserId,
+    /// Owner display name.
     pub owner_display_name: String,
+    /// Bucket ACL.
     pub acl: AccessControlPolicy,
+    /// Default canned ACL for new objects without `x-amz-acl`.
     pub default_object_acl: CannedAcl,
 }
 
+/// Persisted object metadata (`meta.json` under `current/`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObjectMeta {
+    /// Object key.
     pub key: String,
+    /// Body size in bytes.
     pub size: u64,
+    /// Quoted ETag.
     pub etag: String,
+    /// MIME type.
     pub content_type: String,
+    /// Last modification time (RFC3339).
     pub last_modified: String,
+    /// Object owner.
     pub owner: CanonicalUserId,
+    /// Owner display name.
     pub owner_display_name: String,
+    /// Per-object ACL (rich grants).
     pub acl: AccessControlPolicy,
+    /// `x-amz-meta-*` user metadata.
     #[serde(default)]
     pub user_meta: std::collections::HashMap<String, String>,
 }
 
+/// Options for [`ObjectStore::put_object`] / copy / stream puts.
 #[derive(Debug, Clone)]
 pub struct PutObjectOpts {
+    /// Optional Content-Type (defaults to `application/octet-stream`).
     pub content_type: Option<String>,
+    /// Optional canned ACL from `x-amz-acl`.
     pub canned_acl: Option<CannedAcl>,
+    /// Fully resolved ACL (wins over canned when set).
     pub acl: Option<AccessControlPolicy>,
+    /// Uploading principal.
     pub owner: CanonicalUserId,
+    /// Display name for owner.
     pub owner_display_name: String,
+    /// Bucket default when neither canned nor full ACL is set.
     pub default_object_acl: CannedAcl,
+    /// User metadata map.
     pub user_meta: std::collections::HashMap<String, String>,
 }
 
@@ -73,6 +103,9 @@ struct MultipartPart {
     pub size: u64,
 }
 
+/// Local filesystem store + listing index.
+///
+/// Cheap to clone (`Arc` internals); share one instance via [`crate::AppState`].
 #[derive(Clone)]
 pub struct ObjectStore {
     data_dir: PathBuf,
@@ -82,6 +115,7 @@ pub struct ObjectStore {
 }
 
 impl ObjectStore {
+    /// Open (or create) the data directory and listing index.
     pub fn open(data_dir: PathBuf, metrics: Metrics) -> Result<Self, FlashError> {
         std::fs::create_dir_all(&data_dir).map_err(io_err)?;
         std::fs::create_dir_all(data_dir.join("buckets")).map_err(io_err)?;
@@ -95,10 +129,12 @@ impl ObjectStore {
         })
     }
 
+    /// Configured data root.
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
     }
 
+    /// Readiness probe: data dir exists and is writable.
     pub fn is_ready(&self) -> bool {
         self.data_dir.exists()
             && std::fs::OpenOptions::new()
@@ -120,6 +156,7 @@ impl ObjectStore {
             .clone()
     }
 
+    /// Create an empty bucket with a private bucket ACL.
     pub async fn create_bucket(
         &self,
         name: &str,
@@ -148,6 +185,7 @@ impl ObjectStore {
         Ok(info)
     }
 
+    /// Load bucket metadata or [`FlashError::NoSuchBucket`].
     pub async fn get_bucket(&self, name: &str) -> Result<BucketInfo, FlashError> {
         let path = layout::bucket_json_path(&self.data_dir, name);
         if !path.exists() {
@@ -156,6 +194,7 @@ impl ObjectStore {
         read_json(&path).await
     }
 
+    /// Delete an empty bucket (fails with [`FlashError::BucketNotEmpty`]).
     pub async fn delete_bucket(&self, name: &str) -> Result<(), FlashError> {
         let _ = self.get_bucket(name).await?;
         let count = self.index.count_in_bucket(name)?;
@@ -167,6 +206,7 @@ impl ObjectStore {
         Ok(())
     }
 
+    /// List all buckets under the data dir (sorted by name).
     pub async fn list_buckets(&self) -> Result<Vec<BucketInfo>, FlashError> {
         let root = self.data_dir.join("buckets");
         let mut out = Vec::new();
@@ -229,6 +269,9 @@ impl ObjectStore {
         Ok(Some(BucketPolicy::parse_json(&raw)?))
     }
 
+    /// Write-through put: atomic disk write, then index update.
+    ///
+    /// Callers decide whether to insert into the RAM cache afterwards.
     pub async fn put_object(
         &self,
         bucket: &str,
@@ -299,6 +342,7 @@ impl ObjectStore {
         Ok(meta)
     }
 
+    /// Stream a large body to disk without buffering the entire object in RAM.
     pub async fn put_object_stream(
         &self,
         bucket: &str,
@@ -389,6 +433,7 @@ impl ObjectStore {
         read_json(&path).await
     }
 
+    /// Read a full object into memory (for small objects / cache fill).
     pub async fn read_object_bytes(
         &self,
         bucket: &str,
@@ -407,6 +452,7 @@ impl ObjectStore {
         Ok((meta, Bytes::from(data)))
     }
 
+    /// Open object body as an async file for streaming responses.
     pub async fn open_object_file(
         &self,
         bucket: &str,
@@ -481,8 +527,9 @@ impl ObjectStore {
         self.put_object(dst_bucket, dst_key, bytes, opts).await
     }
 
-    // --- Multipart ---
+    // --- Multipart -----------------------------------------------------------
 
+    /// Start a multipart upload and return the upload id.
     pub async fn create_multipart(
         &self,
         bucket: &str,
@@ -511,6 +558,7 @@ impl ObjectStore {
         Ok(upload_id)
     }
 
+    /// Store one multipart part; returns the part ETag.
     pub async fn upload_part(
         &self,
         bucket: &str,
@@ -542,6 +590,7 @@ impl ObjectStore {
         Ok(etag)
     }
 
+    /// Concatenate parts in order into the final object and drop staging data.
     pub async fn complete_multipart(
         &self,
         bucket: &str,
@@ -668,6 +717,7 @@ impl ObjectStore {
     }
 }
 
+/// MD5 hex digest wrapped in quotes (S3 ETag style for single-part uploads).
 fn md5_etag(data: &[u8]) -> String {
     let mut h = Md5::new();
     h.update(data);
@@ -678,6 +728,7 @@ fn io_err(e: std::io::Error) -> FlashError {
     FlashError::Internal(e.to_string())
 }
 
+/// Write `data` to `path` via temp file + fsync + rename (POSIX-atomic replace).
 async fn atomic_write_bytes(path: &Path, data: &[u8]) -> Result<(), FlashError> {
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await.map_err(io_err)?;

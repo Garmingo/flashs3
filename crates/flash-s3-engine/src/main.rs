@@ -1,3 +1,8 @@
+//! `flash-s3-engine` binary entrypoint.
+//!
+//! Boots tracing, loads [`flash_s3_engine::Config`], serves the Axum router,
+//! and shuts down gracefully on Ctrl+C / SIGTERM.
+
 use std::net::SocketAddr;
 
 use anyhow::Context;
@@ -40,6 +45,7 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Wait for Ctrl+C or SIGTERM before draining in-flight requests.
 async fn shutdown_signal() {
     let ctrl_c = async {
         signal::ctrl_c()

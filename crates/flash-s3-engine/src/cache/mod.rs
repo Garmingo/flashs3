@@ -1,3 +1,10 @@
+//! In-memory object body cache (moka, byte-weighted).
+//!
+//! Hybrid strategy (see architecture plan):
+//! - Objects ≤ `object_max_bytes` are eligible for cache after a successful disk write
+//! - Larger objects are streamed from disk and never cached
+//! - Policy `None` makes every method a no-op
+
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -6,6 +13,7 @@ use moka::future::Cache;
 
 use crate::metrics::Metrics;
 
+/// Process-local object cache keyed by `"{bucket}\0{key}"`.
 #[derive(Clone)]
 pub struct ObjectCache {
     inner: Option<Cache<String, Bytes>>,
@@ -14,6 +22,7 @@ pub struct ObjectCache {
 }
 
 impl ObjectCache {
+    /// Build a cache from engine [`CacheConfig`].
     pub fn new(config: CacheConfig, metrics: Metrics) -> Self {
         let inner = match config.policy {
             CachePolicyKind::None => None,
@@ -36,6 +45,7 @@ impl ObjectCache {
         format!("{bucket}\0{key}")
     }
 
+    /// Lookup a cached body; updates hit/miss metrics.
     pub async fn get(&self, bucket: &str, key: &str) -> Option<Bytes> {
         let Some(cache) = &self.inner else {
             return None;
@@ -52,6 +62,7 @@ impl ObjectCache {
         }
     }
 
+    /// Insert if the body is within the per-object size cap.
     pub async fn insert(&self, bucket: &str, key: &str, data: Bytes) {
         let Some(cache) = &self.inner else {
             return;
@@ -63,6 +74,7 @@ impl ObjectCache {
         self.refresh_gauges(cache);
     }
 
+    /// Drop a key after overwrite/delete.
     pub async fn invalidate(&self, bucket: &str, key: &str) {
         if let Some(cache) = &self.inner {
             cache.invalidate(&Self::cache_key(bucket, key)).await;
@@ -75,13 +87,16 @@ impl ObjectCache {
         self.metrics.cache_bytes.set(cache.weighted_size() as i64);
     }
 
+    /// Max object size eligible for caching.
     pub fn object_max_bytes(&self) -> u64 {
         self.object_max_bytes
     }
 
+    /// Whether a cache backend is configured.
     pub fn enabled(&self) -> bool {
         self.inner.is_some()
     }
 }
 
+/// Shared cache handle stored in [`crate::AppState`].
 pub type SharedObjectCache = Arc<ObjectCache>;

@@ -65,8 +65,41 @@ kubectl apply -f deploy/examples/bucket.yaml
 | `FLASHS3_CACHE_MAX_BYTES` | `268435456` |
 | `FLASHS3_CACHE_OBJECT_MAX_BYTES` | `4194304` |
 | `FLASHS3_ACCESS_KEY` / `FLASHS3_SECRET_KEY` | Bootstrap Root-Key |
+| `FLASHS3_CREDENTIALS_KEY` | optional — encrypts secrets in `credentials.json` (AES-256-GCM); unset = plaintext |
 | `FLASHS3_REGION` | `us-east-1` |
 | `FLASHS3_DEFAULT_OBJECT_ACL` | `private` |
+
+When `FLASHS3_CREDENTIALS_KEY` is set, each `secret_key` in `credentials.json` is stored as
+`enc:v1:…`. The same key is required on every start; losing it makes encrypted secrets unrecoverable.
+
+## Tests
+
+```bash
+cargo test
+```
+
+Coverage includes ACL/policy/identity unit tests plus engine integration tests
+(storage, HTTP/SigV4, cache, multipart, copy).
+
+## Benchmarks
+
+**HTTP end-to-end** (write, cold read with cache disabled, warm read with LRU):
+
+```bash
+cargo build --release -p flash-s3-engine
+python3 scripts/benchmark.py --objects 200 --size 65536 --concurrency 4
+python3 scripts/benchmark.py --profile latency   # many 4KiB objects
+python3 scripts/benchmark.py --endpoint http://127.0.0.1:9000
+```
+
+**In-process micro-bench** (disk write/read vs moka cache hits, no HTTP/SigV4):
+
+```bash
+cargo run -p flash-s3-engine --example micro_bench --release
+BENCH_OBJECTS=1000 BENCH_SIZE=4096 cargo run -p flash-s3-engine --example micro_bench --release
+```
+
+Output includes ops/s, MiB/s, and p50/p95/p99 (HTTP script). Optional `--json-out results.json`.
 
 ## License
 

@@ -1,3 +1,8 @@
+//! redb-backed key index for fast `ListObjectsV2` without walking the filesystem.
+//!
+//! Keys are stored as `"{bucket}\0{objectKey}"` so range scans stay per-bucket.
+//! The index is rebuildable from disk if corrupted (rebuild not yet automated).
+
 use std::path::Path;
 use std::sync::Arc;
 
@@ -8,22 +13,31 @@ use flash_s3_common::FlashError;
 
 const TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("objects");
 
+/// Lightweight listing metadata mirrored from object `meta.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexEntry {
+    /// Bucket name.
     pub bucket: String,
+    /// Object key.
     pub key: String,
+    /// Size in bytes.
     pub size: u64,
+    /// Quoted MD5 ETag.
     pub etag: String,
+    /// RFC3339 timestamp.
     pub last_modified: String,
+    /// MIME type.
     pub content_type: String,
 }
 
+/// Embedded key/value index (`objects.redb`).
 #[derive(Clone)]
 pub struct ObjectIndex {
     db: Arc<Database>,
 }
 
 impl ObjectIndex {
+    /// Open or create the index database at `path`.
     pub fn open(path: &Path) -> Result<Self, FlashError> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(io_err)?;
@@ -43,6 +57,7 @@ impl ObjectIndex {
         format!("{bucket}\0{key}")
     }
 
+    /// Insert or update an object listing entry.
     pub fn put(&self, entry: &IndexEntry) -> Result<(), FlashError> {
         let k = Self::compound_key(&entry.bucket, &entry.key);
         let v = serde_json::to_vec(entry).map_err(|e| FlashError::Internal(e.to_string()))?;
@@ -63,6 +78,7 @@ impl ObjectIndex {
         Ok(())
     }
 
+    /// Remove an object from the listing index.
     pub fn delete(&self, bucket: &str, key: &str) -> Result<(), FlashError> {
         let k = Self::compound_key(bucket, key);
         let tx = self
@@ -82,6 +98,7 @@ impl ObjectIndex {
         Ok(())
     }
 
+    /// Lookup a single listing entry (unused by hot path; kept for rebuild/tools).
     #[allow(dead_code)]
     pub fn get(&self, bucket: &str, key: &str) -> Result<Option<IndexEntry>, FlashError> {
         let k = Self::compound_key(bucket, key);
@@ -105,6 +122,9 @@ impl ObjectIndex {
         }
     }
 
+    /// List objects in `bucket` with optional prefix / pagination.
+    ///
+    /// Returns `(entries, truncated)`.
     pub fn list(
         &self,
         bucket: &str,
@@ -159,6 +179,7 @@ impl ObjectIndex {
         Ok((out, truncated))
     }
 
+    /// Count indexed objects in a bucket (used by `DeleteBucket`).
     pub fn count_in_bucket(&self, bucket: &str) -> Result<usize, FlashError> {
         let (entries, _) = self.list(bucket, "", None, usize::MAX)?;
         Ok(entries.len())
