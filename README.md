@@ -102,6 +102,10 @@ kubectl create secret docker-registry garmingo-registry \
 kubectl apply -f deploy/operator/deployment.yaml
 ```
 
+Das Operator-Deployment mountet das ServiceAccount-Token explizit (projected Volume).
+Ohne dieses Mount scheitert `kube::Client::try_default()` mit
+`failed to read the default namespace`.
+
 In `deploy/operator/deployment.yaml` bei Bedarf `imagePullSecrets` aktivieren und das Image-Tag auf ein Release setzen (z. B. `…/operator:v0.1.0`).
 
 ```bash

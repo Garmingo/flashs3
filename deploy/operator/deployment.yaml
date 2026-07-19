@@ -16,6 +16,9 @@ spec:
         app.kubernetes.io/name: flash-s3-operator
     spec:
       serviceAccountName: flash-s3-operator
+      # Required for kube-rs Client::try_default() / in-cluster config.
+      # Some clusters disable automount by default on ServiceAccounts.
+      automountServiceAccountToken: true
       containers:
         - name: operator
           image: registry.garmingo.net/garmingo/flashs3/operator:latest
@@ -23,6 +26,10 @@ spec:
           env:
             - name: RUST_LOG
               value: info
+          volumeMounts:
+            - name: kube-api-access
+              mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+              readOnly: true
           resources:
             requests:
               cpu: 50m
@@ -30,6 +37,27 @@ spec:
             limits:
               cpu: "1"
               memory: 256Mi
+      volumes:
+        # Explicit projected mount so token/ca/namespace exist even when
+        # cluster policies suppress the default automount.
+        - name: kube-api-access
+          projected:
+            defaultMode: 420
+            sources:
+              - serviceAccountToken:
+                  expirationSeconds: 3607
+                  path: token
+              - configMap:
+                  name: kube-root-ca.crt
+                  items:
+                    - key: ca.crt
+                      path: ca.crt
+              - downwardAPI:
+                  items:
+                    - path: namespace
+                      fieldRef:
+                        apiVersion: v1
+                        fieldPath: metadata.namespace
       # Uncomment if the registry requires auth:
       # imagePullSecrets:
       #   - name: garmingo-registry
