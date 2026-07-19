@@ -6,6 +6,10 @@ The core application, `flash-s3-engine`, is fully standalone: S3 HTTP, an in-mem
 [`moka`](https://github.com/moka-rs/moka) cache, and direct disk I/O. The Kubernetes
 operator is optional.
 
+Built for small footprints: the `linux/amd64` engine image
+`registry.garmingo.net/garmingo/flashs3/engine:v0.1.1` is **35.4 MB** according
+to Docker's uncompressed image-size metadata — comfortably below 40 MB.
+
 ## Quick start (local)
 
 ```bash
@@ -61,11 +65,11 @@ Release tags trigger GitLab CI (Kaniko), which publishes two images to the Garmi
 Both images also receive the `latest` tag. Example using a fixed release:
 
 ```text
-registry.garmingo.net/garmingo/flashs3/engine:v0.2.0
-registry.garmingo.net/garmingo/flashs3/operator:v0.2.0
+registry.garmingo.net/garmingo/flashs3/engine:v0.1.1
+registry.garmingo.net/garmingo/flashs3/operator:v0.1.1
 ```
 
-Release builds set the binary version from the Git tag (`VERSION` build argument → `CARGO_PKG_VERSION`). A `v0.2.0` tag makes `flash-s3-engine --version` report `0.2.0`.
+Release builds set the binary version from the Git tag (`VERSION` build argument → `CARGO_PKG_VERSION`). A `v0.1.1` tag makes `flash-s3-engine --version` report `0.1.1`.
 
 ### Run the engine standalone (without the operator)
 
@@ -110,7 +114,7 @@ The operator Deployment explicitly mounts the ServiceAccount token through a pro
 Without this mount, `kube::Client::try_default()` fails with
 `failed to read the default namespace`.
 
-If needed, enable `imagePullSecrets` in `deploy/operator/deployment.yaml` and pin the image to a release tag (for example, `…/operator:v0.2.0`).
+If needed, enable `imagePullSecrets` in `deploy/operator/deployment.yaml` and pin the image to a release tag (for example, `…/operator:v0.1.1`).
 
 ```bash
 kubectl -n flashs3-system rollout status deploy/flash-s3-operator
@@ -178,7 +182,9 @@ Coverage includes ACL/policy/identity unit tests plus engine integration tests
 
 ## Benchmarks
 
-**HTTP end-to-end** (write, cold read with cache disabled, warm read with LRU):
+### FlashS3-only benchmarks
+
+**HTTP end-to-end** (write, first read, and a second read with the LRU cache warm):
 
 ```bash
 cargo build --release -p flash-s3-engine
@@ -194,7 +200,108 @@ cargo run -p flash-s3-engine --example micro_bench --release
 BENCH_OBJECTS=1000 BENCH_SIZE=4096 cargo run -p flash-s3-engine --example micro_bench --release
 ```
 
-Output includes ops/s, MiB/s, and p50/p95/p99 (HTTP script). Optional `--json-out results.json`.
+Output includes ops/s, MiB/s, and p50/p90/p95/p99 (HTTP script). Optional `--json-out results.json`.
+
+### Reproducible comparison: FlashS3, MinIO, and Garage
+
+`scripts/benchmark_compare.py` runs the same path-style S3 HTTP/SigV4 workload
+against all three backends. It starts one Docker container at a time and resets
+its volume before each run, so the backends do not contend for system resources
+and no data survives from a previous measurement.
+
+The benchmark environment is:
+
+| Property | Value |
+|----------|-------|
+| Host | 14-inch MacBook Pro |
+| CPU | Apple M3 Pro |
+| Memory | 18 GB |
+| Storage | Docker Desktop virtual disk on the local SSD |
+| Container platform | `linux/amd64` for all backends (emulated by Docker Desktop on Apple Silicon) |
+| Workload matrix | 2,000 objects × 64 KiB, 128 KiB, and 1 MiB × 16, 32, and 1 concurrent clients |
+| Protocol | Path-style S3 over HTTP with AWS SigV4 |
+| FlashS3 cache | `InMemoryLRU`, 512 MiB maximum |
+| FlashS3 | `registry.garmingo.net/garmingo/flashs3/engine:v0.1.1` |
+| MinIO | `minio/minio:RELEASE.2025-04-22T22-12-26Z` |
+| Garage | `dxflrs/garage:v2.3.0` in single-node mode |
+
+Run the comparison:
+
+```bash
+cp benchmarks/.env.example benchmarks/.env
+python3 scripts/benchmark_compare.py
+```
+
+The runner pulls FlashS3 from the container registry; it does not build the
+local Dockerfile. To compare another released FlashS3 version, update
+`FLASHS3_IMAGE` in `benchmarks/.env`.
+
+The default command runs all nine workloads (27 backend executions). For a
+short custom run, use `--single`:
+
+```bash
+python3 scripts/benchmark_compare.py --single --objects 2000 --size 65536 --concurrency 16
+```
+
+Each run produces the raw per-backend results and a combined report under
+`benchmarks/results/`. The report records the exact Docker image IDs, host
+metadata, workload, throughput, latency percentiles, and error count.
+
+#### Results
+
+The complete 3 × 3 matrix below completed on 2026-07-19 with zero benchmark
+errors across 162,000 S3 operations. Each cell shows **MiB/s · p50 · p90**,
+with p50 and p90 in milliseconds. Results are specific to the documented local
+Docker Desktop environment; they are not production or distributed-cluster
+benchmarks.
+
+**PUT**
+
+| Workload | FlashS3 (MiB/s · p50 · p90) | MinIO (MiB/s · p50 · p90) | Garage (MiB/s · p50 · p90) |
+|----------|---------|-------|--------|
+| 2,000 × 64 KiB, 16 clients | 56.15 · 16.07 ms · 23.54 ms | 80.26 · 10.74 ms · 17.39 ms | 47.80 · 16.15 ms · 23.68 ms |
+| 2,000 × 64 KiB, 32 clients | 65.51 · 27.54 ms · 39.47 ms | 77.23 · 22.07 ms · 41.20 ms | 51.91 · 32.56 ms · 43.78 ms |
+| 2,000 × 64 KiB, 1 client | 14.62 · 3.89 ms · 5.18 ms | 17.18 · 3.30 ms · 4.43 ms | 16.63 · 3.03 ms · 4.43 ms |
+| 2,000 × 128 KiB, 16 clients | 83.37 · 21.92 ms · 33.94 ms | 105.75 · 17.39 ms · 27.80 ms | 64.12 · 24.51 ms · 37.25 ms |
+| 2,000 × 128 KiB, 32 clients | 88.94 · 41.09 ms · 63.91 ms | 105.61 · 35.43 ms · 54.65 ms | 77.67 · 41.46 ms · 57.83 ms |
+| 2,000 × 128 KiB, 1 client | 23.86 · 4.67 ms · 6.28 ms | 33.08 · 3.28 ms · 4.60 ms | 36.47 · 3.04 ms · 4.04 ms |
+| 2,000 × 1 MiB, 16 clients | 141.64 · 109.35 ms · 126.04 ms | 147.04 · 106.10 ms · 118.30 ms | 127.80 · 118.94 ms · 133.17 ms |
+| 2,000 × 1 MiB, 32 clients | 145.96 · 210.02 ms · 235.00 ms | 157.84 · 195.43 ms · 212.84 ms | 131.17 · 226.70 ms · 269.12 ms |
+| 2,000 × 1 MiB, 1 client | 65.38 · 13.62 ms · 19.04 ms | 75.86 · 11.48 ms · 16.54 ms | 77.86 · 11.26 ms · 15.95 ms |
+
+**GET after write**
+
+| Workload | FlashS3 (MiB/s · p50 · p90) | MinIO (MiB/s · p50 · p90) | Garage (MiB/s · p50 · p90) |
+|----------|---------|-------|--------|
+| 2,000 × 64 KiB, 16 clients | 156.19 · 5.49 ms · 8.54 ms | 131.02 · 6.66 ms · 9.93 ms | 75.01 · 11.16 ms · 15.11 ms |
+| 2,000 × 64 KiB, 32 clients | 169.54 · 10.73 ms · 16.50 ms | 144.03 · 12.26 ms · 19.00 ms | 78.12 · 21.96 ms · 31.01 ms |
+| 2,000 × 64 KiB, 1 client | 41.45 · 1.16 ms · 2.06 ms | 36.75 · 1.38 ms · 2.30 ms | 20.65 · 2.65 ms · 3.85 ms |
+| 2,000 × 128 KiB, 16 clients | 178.96 · 10.28 ms · 15.55 ms | 167.41 · 10.73 ms · 16.26 ms | 110.63 · 16.42 ms · 21.41 ms |
+| 2,000 × 128 KiB, 32 clients | 190.14 · 19.52 ms · 29.20 ms | 167.50 · 21.93 ms · 32.66 ms | 107.63 · 33.08 ms · 51.74 ms |
+| 2,000 × 128 KiB, 1 client | 86.82 · 1.16 ms · 1.92 ms | 60.11 · 1.62 ms · 2.77 ms | 42.20 · 2.58 ms · 3.56 ms |
+| 2,000 × 1 MiB, 16 clients | 233.97 · 63.99 ms · 84.46 ms | 238.96 · 65.58 ms · 83.77 ms | 239.31 · 63.86 ms · 80.27 ms |
+| 2,000 × 1 MiB, 32 clients | 261.34 · 118.14 ms · 150.09 ms | 297.28 · 105.16 ms · 124.84 ms | 238.07 · 129.58 ms · 150.89 ms |
+| 2,000 × 1 MiB, 1 client | 170.81 · 5.06 ms · 6.74 ms | 157.15 · 5.46 ms · 7.41 ms | 134.34 · 6.55 ms · 8.24 ms |
+
+**Repeat GET**
+
+| Workload | FlashS3 (MiB/s · p50 · p90) | MinIO (MiB/s · p50 · p90) | Garage (MiB/s · p50 · p90) |
+|----------|---------|-------|--------|
+| 2,000 × 64 KiB, 16 clients | 152.96 · 5.87 ms · 9.24 ms | 153.88 · 5.87 ms · 8.68 ms | 85.48 · 11.19 ms · 14.41 ms |
+| 2,000 × 64 KiB, 32 clients | 157.60 · 11.70 ms · 17.25 ms | 137.31 · 13.51 ms · 20.65 ms | 89.89 · 21.84 ms · 28.51 ms |
+| 2,000 × 64 KiB, 1 client | 43.47 · 1.14 ms · 1.94 ms | 33.21 · 1.50 ms · 2.59 ms | 22.07 · 2.42 ms · 3.40 ms |
+| 2,000 × 128 KiB, 16 clients | 193.79 · 9.58 ms · 14.05 ms | 174.60 · 10.58 ms · 16.03 ms | 116.57 · 16.30 ms · 21.21 ms |
+| 2,000 × 128 KiB, 32 clients | 203.00 · 18.58 ms · 27.40 ms | 170.40 · 22.23 ms · 32.21 ms | 112.39 · 33.76 ms · 46.61 ms |
+| 2,000 × 128 KiB, 1 client | 86.40 · 1.15 ms · 1.97 ms | 69.84 · 1.47 ms · 2.37 ms | 38.23 · 2.92 ms · 3.97 ms |
+| 2,000 × 1 MiB, 16 clients | 241.70 · 64.86 ms · 82.85 ms | 233.57 · 65.53 ms · 85.36 ms | 237.10 · 63.51 ms · 83.32 ms |
+| 2,000 × 1 MiB, 32 clients | 258.39 · 115.86 ms · 156.19 ms | 253.97 · 116.18 ms · 155.75 ms | 236.10 · 127.28 ms · 160.90 ms |
+| 2,000 × 1 MiB, 1 client | 157.50 · 5.15 ms · 7.19 ms | 167.20 · 5.13 ms · 6.64 ms | 135.37 · 6.52 ms · 8.18 ms |
+
+Each backend is measured after writing the objects and then reading the same
+objects twice. Therefore, the GET figures include each system's cache behavior
+(including the host OS page cache) and must not be interpreted as cold-disk
+read results. Do not compare them with FlashS3's in-process micro-benchmark:
+it intentionally excludes HTTP, SigV4, and container overhead.
 
 ## License
 

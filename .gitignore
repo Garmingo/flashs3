@@ -5,3 +5,5 @@
 *.swp
 .env
 credentials.json
+/benchmarks/.env
+/benchmarks/results/

@@ -57,6 +57,7 @@ class BenchResult:
     seconds: float
     errors: int
     latency_ms_p50: float
+    latency_ms_p90: float
     latency_ms_p95: float
     latency_ms_p99: float
 
@@ -185,6 +186,7 @@ def run_ops(
         seconds=elapsed,
         errors=errors,
         latency_ms_p50=percentile(latencies, 50),
+        latency_ms_p90=percentile(latencies, 90),
         latency_ms_p95=percentile(latencies, 95),
         latency_ms_p99=percentile(latencies, 99),
     )
@@ -243,7 +245,8 @@ def print_result(r: BenchResult) -> None:
     print(
         f"  {r.name:28s}  ops={r.ops:6d}  errors={r.errors}  "
         f"{r.ops_per_sec:8.1f} ops/s  {r.mib_per_sec:8.2f} MiB/s  "
-        f"p50={r.latency_ms_p50:7.2f}ms  p95={r.latency_ms_p95:7.2f}ms  p99={r.latency_ms_p99:7.2f}ms"
+        f"p50={r.latency_ms_p50:7.2f}ms  p90={r.latency_ms_p90:7.2f}ms  "
+        f"p95={r.latency_ms_p95:7.2f}ms  p99={r.latency_ms_p99:7.2f}ms"
     )
 
 
@@ -259,6 +262,12 @@ def main() -> int:
         help="latency profile uses many small objects (overrides --objects/--size defaults if those left default)",
     )
     ap.add_argument("--endpoint", type=str, default="", help="use existing engine (skip spawn)")
+    ap.add_argument(
+        "--label",
+        type=str,
+        default="FlashS3",
+        help="backend name shown in benchmark output when using --endpoint",
+    )
     ap.add_argument("--cache-max-bytes", type=int, default=512 * 1024 * 1024)
     ap.add_argument("--json-out", type=str, default="", help="write results JSON to path")
     args = ap.parse_args()
@@ -272,7 +281,7 @@ def main() -> int:
     payload = os.urandom(args.size)
     keys = [f"bench/obj-{i:06d}.bin" for i in range(args.objects)]
 
-    print("FlashS3 benchmark")
+    print(f"{args.label} benchmark")
     print(f"  objects={args.objects}  size={args.size} B  concurrency={args.concurrency}")
 
     procs: list[subprocess.Popen] = []
@@ -289,16 +298,17 @@ def main() -> int:
             results.append(r)
             print_result(r)
 
-            # READ warm (assume cache already filling from writes if engine has cache)
-            # cold: read once after note — first pass
+            # Two read passes immediately after writing. A backend may serve these
+            # from its own cache or the OS page cache, so neither is a cold-read
+            # measurement.
             work_get = [("GET", f"/bench/{k}", payload) for k in keys]  # body len = size for accounting
-            r_cold = run_ops("read_first_pass", client, work_get, args.concurrency)
-            results.append(r_cold)
-            print_result(r_cold)
+            r_after_write = run_ops("read_after_write", client, work_get, args.concurrency)
+            results.append(r_after_write)
+            print_result(r_after_write)
 
-            r_warm = run_ops("read_second_pass_warm", client, work_get, args.concurrency)
-            results.append(r_warm)
-            print_result(r_warm)
+            r_repeat = run_ops("read_repeat", client, work_get, args.concurrency)
+            results.append(r_repeat)
+            print_result(r_repeat)
         else:
             # Controlled: cold with cache=None, then warm with InMemoryLRU on same data dir
             with tempfile.TemporaryDirectory(prefix="flashs3-bench-") as td:

@@ -1,0 +1,56 @@
+name: flashs3-benchmark
+
+# Each backend is started independently by scripts/benchmark_compare.py, so
+# they never contend for CPU, memory, or disk I/O during a measurement.
+services:
+  flashs3:
+    # Use the release image so FlashS3 is benchmarked exactly as users deploy it.
+    image: ${FLASHS3_IMAGE:-registry.garmingo.net/garmingo/flashs3/engine:v0.1.1}
+    # FlashS3 v0.1.1 is currently published for amd64. Pin every backend to
+    # the same platform so an Apple Silicon host does not compare emulation
+    # against native arm64 images.
+    platform: linux/amd64
+    environment:
+      FLASHS3_ACCESS_KEY: ${BENCH_ACCESS_KEY}
+      FLASHS3_SECRET_KEY: ${BENCH_SECRET_KEY}
+      FLASHS3_REGION: ${BENCH_REGION}
+      FLASHS3_CACHE_POLICY: InMemoryLRU
+      FLASHS3_CACHE_MAX_BYTES: 536870912
+      FLASHS3_CACHE_OBJECT_MAX_BYTES: 4194304
+    ports:
+      - "19000:9000"
+    volumes:
+      - flashs3-data:/data
+
+  minio:
+    image: ${MINIO_IMAGE}
+    platform: linux/amd64
+    command: server /data --address ":9000" --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${BENCH_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${BENCH_SECRET_KEY}
+    ports:
+      - "19001:9000"
+    volumes:
+      - minio-data:/data
+
+  garage:
+    image: ${GARAGE_IMAGE}
+    platform: linux/amd64
+    command: ["/garage", "server", "--single-node", "--default-bucket"]
+    environment:
+      GARAGE_DEFAULT_ACCESS_KEY: ${BENCH_ACCESS_KEY}
+      GARAGE_DEFAULT_SECRET_KEY: ${BENCH_SECRET_KEY}
+      GARAGE_DEFAULT_BUCKET: bench
+    ports:
+      - "19002:3900"
+    volumes:
+      - ./garage.toml:/etc/garage.toml:ro
+      - garage-meta:/var/lib/garage/meta
+      - garage-data:/var/lib/garage/data
+
+volumes:
+  flashs3-data:
+  minio-data:
+  garage-meta:
+  garage-data:

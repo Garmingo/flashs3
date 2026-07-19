@@ -6,7 +6,7 @@
 #
 # Two Kaniko jobs build the engine and operator images in parallel and push
 # them to this project's GitLab Container Registry. Each image is tagged with
-# the release tag (e.g. v0.2.0) and with `latest`. The same tag is passed as
+# the release tag (e.g. v0.1.1) and with `latest`. The same tag is passed as
 # Docker build-arg VERSION so the Rust binaries report that version
 # (`--version` / startup logs).
 
