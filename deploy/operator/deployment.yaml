@@ -1,0 +1,35 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flash-s3-operator
+  namespace: flashs3-system
+  labels:
+    app.kubernetes.io/name: flash-s3-operator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: flash-s3-operator
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: flash-s3-operator
+    spec:
+      serviceAccountName: flash-s3-operator
+      containers:
+        - name: operator
+          image: registry.garmingo.net/garmingo/flashs3/operator:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: RUST_LOG
+              value: info
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: "1"
+              memory: 256Mi
+      # Uncomment if the registry requires auth:
+      # imagePullSecrets:
+      #   - name: garmingo-registry

@@ -1,0 +1,47 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: flashs3-system
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: flash-s3-operator
+  namespace: flashs3-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: flash-s3-operator
+rules:
+  - apiGroups: [storage.flashs3.io]
+    resources: [flashs3buckets]
+    verbs: [get, list, watch, patch, update]
+  - apiGroups: [storage.flashs3.io]
+    resources: [flashs3buckets/status]
+    verbs: [get, patch, update]
+  - apiGroups: [storage.flashs3.io]
+    resources: [flashs3buckets/finalizers]
+    verbs: [update]
+  - apiGroups: [""]
+    resources: [persistentvolumeclaims, secrets, services]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [apps]
+    resources: [deployments]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [""]
+    resources: [events]
+    verbs: [create, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: flash-s3-operator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: flash-s3-operator
+subjects:
+  - kind: ServiceAccount
+    name: flash-s3-operator
+    namespace: flashs3-system

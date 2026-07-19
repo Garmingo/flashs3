@@ -6,7 +6,7 @@ metadata:
 spec:
   size: 50Gi
   # storageClassName: longhorn
-  image: ghcr.io/garmingo/flash-s3-engine:latest
+  image: registry.garmingo.net/garmingo/flashs3/engine:latest
   defaultObjectAcl: private
   cache:
     policy: InMemoryLRU

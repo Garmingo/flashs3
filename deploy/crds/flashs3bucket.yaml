@@ -39,7 +39,7 @@ spec:
                   type: string
                 image:
                   type: string
-                  default: ghcr.io/garmingo/flash-s3-engine:latest
+                  default: registry.garmingo.net/garmingo/flashs3/engine:latest
                 auth:
                   type: object
                   properties:

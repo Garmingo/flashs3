@@ -45,7 +45,7 @@ pub struct FlashS3BucketSpec {
 }
 
 fn default_image() -> String {
-    "ghcr.io/garmingo/flash-s3-engine:latest".into()
+    "registry.garmingo.net/garmingo/flashs3/engine:latest".into()
 }
 fn default_acl() -> String {
     "private".into()
