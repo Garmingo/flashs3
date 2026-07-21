@@ -114,11 +114,11 @@ async fn dispatch_inner(
     path: Option<String>,
     request_id: &str,
 ) -> Result<Response, FlashError> {
-    let query_map = parse_query(uri.query().unwrap_or(""));
-    let path_str = match &path {
-        Some(p) => format!("/{p}"),
-        None => "/".to_string(),
-    };
+    let raw_query = uri.query().unwrap_or("");
+    let query_map = parse_query(raw_query);
+    // SigV4 signs the percent-encoded request path. `Path<String>` is decoded
+    // by Axum, so retain the raw URI path for signature verification.
+    let path_str = uri.path().to_string();
     let has_object_key = path
         .as_deref()
         .map(|p| p.split('/').filter(|segment| !segment.is_empty()).count() > 1)
@@ -143,6 +143,7 @@ async fn dispatch_inner(
             &method,
             &path_str,
             &query_map,
+            raw_query,
             &headers,
             payload_hash,
         )?;
@@ -195,6 +196,7 @@ async fn dispatch_inner(
         &method,
         &path_str,
         &query_map,
+        raw_query,
         &headers,
         &payload_hash,
     )?;
@@ -243,6 +245,7 @@ fn authenticate(
     method: &Method,
     path: &str,
     query: &BTreeMap<String, String>,
+    raw_query: &str,
     headers: &HeaderMap,
     payload_hash: &str,
 ) -> Result<AuthContext, FlashError> {
@@ -250,6 +253,7 @@ fn authenticate(
         method.as_str(),
         path,
         query,
+        raw_query,
         headers,
         payload_hash,
         &state.config.region,

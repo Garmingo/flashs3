@@ -34,6 +34,7 @@ pub fn verify_request(
     method: &str,
     path: &str,
     query: &BTreeMap<String, String>,
+    raw_query: &str,
     headers: &HeaderMap,
     payload_hash: &str,
     region: &str,
@@ -41,7 +42,7 @@ pub fn verify_request(
 ) -> Result<Option<AuthResult>, FlashError> {
     // Presigned query auth
     if query.contains_key("X-Amz-Signature") {
-        return verify_presigned(method, path, query, headers, region, creds);
+        return verify_presigned(method, path, query, raw_query, headers, region, creds);
     }
 
     let auth = match headers.get("authorization").and_then(|v| v.to_str().ok()) {
@@ -85,7 +86,7 @@ pub fn verify_request(
         .ok_or(FlashError::SignatureDoesNotMatch)?;
 
     let canonical_headers = build_canonical_headers(headers, signed_headers)?;
-    let canonical_query = canonical_query_string(query);
+    let canonical_query = canonical_query_string(raw_query, false);
     let canonical_request = format!(
         "{method}\n{path}\n{canonical_query}\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
     );
@@ -105,6 +106,7 @@ fn verify_presigned(
     method: &str,
     path: &str,
     query: &BTreeMap<String, String>,
+    raw_query: &str,
     headers: &HeaderMap,
     region: &str,
     creds: &CredentialStore,
@@ -144,9 +146,13 @@ fn verify_presigned(
         .get(access_key)
         .ok_or(FlashError::InvalidAccessKeyId)?;
 
-    let mut q = query.clone();
-    q.remove("X-Amz-Signature");
-    let canonical_query = canonical_query_string(&q);
+    if query.get("X-Amz-Algorithm").map(String::as_str) != Some("AWS4-HMAC-SHA256") {
+        return Err(FlashError::SignatureDoesNotMatch);
+    }
+    if !(1..=604800).contains(&expires) {
+        return Err(FlashError::AccessDenied);
+    }
+    let canonical_query = canonical_query_string(raw_query, true);
     let payload_hash = query
         .get("X-Amz-Content-Sha256")
         .map(|s| s.as_str())
@@ -207,17 +213,31 @@ fn collapse_ws(s: &str) -> String {
     out
 }
 
-fn canonical_query_string(query: &BTreeMap<String, String>) -> String {
-    query
-        .iter()
-        .map(|(k, v)| format!("{}={}", uri_encode(k), uri_encode(v)))
+fn canonical_query_string(raw_query: &str, omit_signature: bool) -> String {
+    let mut pairs = raw_query
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .filter_map(|pair| {
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            let key = urlencoding::decode_binary(key.as_bytes());
+            if omit_signature && key.as_ref() == b"X-Amz-Signature" {
+                return None;
+            }
+            let value = urlencoding::decode_binary(value.as_bytes());
+            Some((uri_encode_bytes(&key), uri_encode_bytes(&value)))
+        })
+        .collect::<Vec<_>>();
+    pairs.sort_unstable();
+    pairs
+        .into_iter()
+        .map(|(key, value)| format!("{key}={value}"))
         .collect::<Vec<_>>()
         .join("&")
 }
 
-fn uri_encode(s: &str) -> String {
+fn uri_encode_bytes(s: &[u8]) -> String {
     let mut out = String::new();
-    for b in s.as_bytes() {
+    for b in s {
         match *b {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
                 out.push(*b as char);
@@ -251,4 +271,182 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
 /// Hex-encoded SHA-256 of the request payload (SigV4 payload hash).
 pub fn hash_payload(body: &[u8]) -> String {
     hex::encode(Sha256::digest(body))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use chrono::Utc;
+    use http::{HeaderMap, HeaderValue};
+    use sha2::Digest;
+    use tempfile::tempdir;
+
+    use super::{
+        canonical_query_string, signing_signature, verify_request, CredentialStore, Sha256,
+    };
+
+    const ACCESS_KEY: &str = "AKIDEXAMPLE";
+    const SECRET_KEY: &str = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY";
+    const REGION: &str = "us-east-1";
+    const HOST: &str = "storage.example.test";
+
+    fn credentials() -> (tempfile::TempDir, CredentialStore) {
+        let dir = tempdir().unwrap();
+        let creds = CredentialStore::open(
+            dir.path(),
+            Some(ACCESS_KEY),
+            Some(SECRET_KEY),
+            None,
+        )
+        .unwrap();
+        (dir, creds)
+    }
+
+    fn sign_presigned(
+        method: &str,
+        path: &str,
+        raw_query_without_signature: &str,
+        date: &str,
+        scope_date: &str,
+        headers: &HeaderMap,
+    ) -> String {
+        let signed_headers = "host";
+        let canonical_headers = format!("host:{HOST}\n");
+        let canonical_request = format!(
+            "{method}\n{path}\n{}\n{canonical_headers}\n{signed_headers}\nUNSIGNED-PAYLOAD",
+            canonical_query_string(raw_query_without_signature, false)
+        );
+        let string_to_sign = format!(
+            "AWS4-HMAC-SHA256\n{date}\n{scope_date}/{REGION}/s3/aws4_request\n{}",
+            hex::encode(Sha256::digest(canonical_request.as_bytes()))
+        );
+        assert_eq!(headers.get("host").unwrap(), HOST);
+        signing_signature(SECRET_KEY, scope_date, REGION, "s3", &string_to_sign)
+    }
+
+    fn parse_query(raw: &str) -> BTreeMap<String, String> {
+        raw.split('&')
+            .filter_map(|pair| {
+                let (key, value) = pair.split_once('=')?;
+                Some((
+                    urlencoding::decode(key).unwrap().into_owned(),
+                    urlencoding::decode(value).unwrap().into_owned(),
+                ))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn canonical_query_preserves_duplicate_parameters_and_encodes_values() {
+        let query = "prefix=voice%2Fupdates&tag=b&tag=a&space=hello%20world";
+        assert_eq!(
+            canonical_query_string(query, false),
+            "prefix=voice%2Fupdates&space=hello%20world&tag=a&tag=b"
+        );
+    }
+
+    #[test]
+    fn canonical_query_omits_only_presigned_signature() {
+        let query =
+            "X-Amz-Signature=deadbeef&X-Amz-Date=20260721T200000Z&X-Amz-Credential=key%2Fscope";
+        assert_eq!(
+            canonical_query_string(query, true),
+            "X-Amz-Credential=key%2Fscope&X-Amz-Date=20260721T200000Z"
+        );
+    }
+
+    #[test]
+    fn accepts_sdk_style_presigned_put_with_duplicate_query_parameters() {
+        let (_dir, creds) = credentials();
+        let now = Utc::now();
+        let date = now.format("%Y%m%dT%H%M%SZ").to_string();
+        let scope_date = now.format("%Y%m%d").to_string();
+        let path = "/voice-updates/bundles/update%20one.zip";
+        let unsigned_query = format!(
+            "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential={ACCESS_KEY}%2F{scope_date}%2F{REGION}%2Fs3%2Faws4_request&X-Amz-Date={date}&X-Amz-Expires=900&X-Amz-SignedHeaders=host&x-id=PutObject&tag=b&tag=a"
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert("host", HeaderValue::from_static(HOST));
+        let signature = sign_presigned(
+            "PUT",
+            path,
+            &unsigned_query,
+            &date,
+            &scope_date,
+            &headers,
+        );
+        let raw_query = format!("{unsigned_query}&X-Amz-Signature={signature}");
+        let query = parse_query(&raw_query);
+
+        assert!(verify_request("PUT", path, &query, &raw_query, &headers, "", REGION, &creds)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn rejects_presigned_url_when_path_or_signed_host_changes() {
+        let (_dir, creds) = credentials();
+        let now = Utc::now();
+        let date = now.format("%Y%m%dT%H%M%SZ").to_string();
+        let scope_date = now.format("%Y%m%d").to_string();
+        let path = "/voice-updates/bundle.zip";
+        let unsigned_query = format!(
+            "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential={ACCESS_KEY}%2F{scope_date}%2F{REGION}%2Fs3%2Faws4_request&X-Amz-Date={date}&X-Amz-Expires=900&X-Amz-SignedHeaders=host"
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert("host", HeaderValue::from_static(HOST));
+        let signature = sign_presigned(
+            "PUT",
+            path,
+            &unsigned_query,
+            &date,
+            &scope_date,
+            &headers,
+        );
+        let raw_query = format!("{unsigned_query}&X-Amz-Signature={signature}");
+        let query = parse_query(&raw_query);
+
+        assert!(verify_request(
+            "PUT",
+            "/voice-updates/other.zip",
+            &query,
+            &raw_query,
+            &headers,
+            "",
+            REGION,
+            &creds
+        )
+        .is_err());
+
+        headers.insert("host", HeaderValue::from_static("other.example.test"));
+        assert!(verify_request("PUT", path, &query, &raw_query, &headers, "", REGION, &creds)
+            .is_err());
+    }
+
+    #[test]
+    fn rejects_expired_presigned_url() {
+        let (_dir, creds) = credentials();
+        let date = "20200101T000000Z";
+        let scope_date = "20200101";
+        let path = "/voice-updates/expired.zip";
+        let unsigned_query = format!(
+            "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential={ACCESS_KEY}%2F{scope_date}%2F{REGION}%2Fs3%2Faws4_request&X-Amz-Date={date}&X-Amz-Expires=1&X-Amz-SignedHeaders=host"
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert("host", HeaderValue::from_static(HOST));
+        let signature = sign_presigned(
+            "PUT",
+            path,
+            &unsigned_query,
+            date,
+            scope_date,
+            &headers,
+        );
+        let raw_query = format!("{unsigned_query}&X-Amz-Signature={signature}");
+        let query = parse_query(&raw_query);
+
+        assert!(verify_request("PUT", path, &query, &raw_query, &headers, "", REGION, &creds)
+            .is_err());
+    }
 }
