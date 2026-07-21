@@ -1,11 +1,15 @@
 //! Disk store + listing index integration tests.
 
+use std::io::SeekFrom;
+
 use bytes::Bytes;
 use flash_s3_common::{
     AccessControlPolicy, CannedAcl, CanonicalUserId, FlashError, ObjectKey,
 };
 use flash_s3_engine::metrics::Metrics;
 use flash_s3_engine::storage::{layout, ObjectStore, PutObjectOpts};
+use futures::future::join_all;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 fn opts(owner: &CanonicalUserId) -> PutObjectOpts {
     PutObjectOpts {
@@ -120,6 +124,141 @@ async fn multipart_roundtrip() {
     let (_, data) = store.read_object_bytes("mparts", &key).await.unwrap();
     assert_eq!(&data[..1024], &p1[..]);
     assert_eq!(&data[1024..], &p2[..]);
+}
+
+#[tokio::test]
+async fn multipart_parallel_parts_preserve_complete_manifest() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = ObjectStore::open(tmp.path().to_path_buf(), Metrics::new().unwrap()).unwrap();
+    let owner = CanonicalUserId::new("o1");
+    store
+        .create_bucket("parallel", owner.clone(), "root", CannedAcl::Private)
+        .await
+        .unwrap();
+
+    let key = ObjectKey::new("parallel.bin").unwrap();
+    let upload_id = store
+        .create_multipart(
+            "parallel",
+            &key,
+            owner,
+            "root",
+            None,
+            Some(CannedAcl::Private),
+        )
+        .await
+        .unwrap();
+    let part_count = 32;
+    let part_size = 128 * 1024;
+
+    let uploads = (1..=part_count).map(|part_number| {
+        let store = store.clone();
+        let upload_id = upload_id.clone();
+        async move {
+            let body = Bytes::from(vec![part_number as u8; part_size]);
+            let etag = store
+                .upload_part("parallel", &upload_id, part_number, body.clone())
+                .await
+                .unwrap();
+            (part_number, etag, body)
+        }
+    });
+    let mut uploaded_parts = join_all(uploads).await;
+    uploaded_parts.sort_by_key(|(part_number, _, _)| *part_number);
+
+    let complete_parts = uploaded_parts
+        .iter()
+        .map(|(part_number, etag, _)| (*part_number, etag.clone()))
+        .collect::<Vec<_>>();
+    let expected = uploaded_parts
+        .iter()
+        .flat_map(|(_, _, body)| body.iter().copied())
+        .collect::<Vec<_>>();
+
+    let meta = store
+        .complete_multipart(
+            "parallel",
+            &upload_id,
+            &complete_parts,
+            CannedAcl::Private,
+        )
+        .await
+        .unwrap();
+    assert_eq!(meta.size, expected.len() as u64);
+
+    let (_, data) = store.read_object_bytes("parallel", &key).await.unwrap();
+    assert_eq!(data.as_ref(), expected.as_slice());
+}
+
+#[tokio::test]
+#[ignore = "writes and assembles 5 GiB; run explicitly with --ignored"]
+async fn multipart_parallel_five_gib_upload() {
+    const PART_SIZE: usize = 5 * 1024 * 1024;
+    const PART_COUNT: i32 = 1024;
+    const CONCURRENCY: i32 = 10;
+    const TOTAL_SIZE: u64 = PART_SIZE as u64 * PART_COUNT as u64;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = ObjectStore::open(tmp.path().to_path_buf(), Metrics::new().unwrap()).unwrap();
+    let owner = CanonicalUserId::new("o1");
+    store
+        .create_bucket("fivegib", owner.clone(), "root", CannedAcl::Private)
+        .await
+        .unwrap();
+
+    let key = ObjectKey::new("five-gib.bin").unwrap();
+    let upload_id = store
+        .create_multipart(
+            "fivegib",
+            &key,
+            owner,
+            "root",
+            None,
+            Some(CannedAcl::Private),
+        )
+        .await
+        .unwrap();
+
+    let mut complete_parts = Vec::with_capacity(PART_COUNT as usize);
+    for first_part in (1..=PART_COUNT).step_by(CONCURRENCY as usize) {
+        let last_part = (first_part + CONCURRENCY - 1).min(PART_COUNT);
+        let uploads = (first_part..=last_part).map(|part_number| {
+            let store = store.clone();
+            let upload_id = upload_id.clone();
+            async move {
+                let marker = ((part_number - 1) % 251 + 1) as u8;
+                let body = Bytes::from(vec![marker; PART_SIZE]);
+                let etag = store
+                    .upload_part("fivegib", &upload_id, part_number, body)
+                    .await
+                    .unwrap();
+                (part_number, etag)
+            }
+        });
+        complete_parts.extend(join_all(uploads).await);
+    }
+    complete_parts.sort_by_key(|(part_number, _)| *part_number);
+
+    let meta = store
+        .complete_multipart("fivegib", &upload_id, &complete_parts, CannedAcl::Private)
+        .await
+        .unwrap();
+    assert_eq!(meta.size, TOTAL_SIZE);
+
+    let mut object = tokio::fs::File::open(layout::data_path(store.data_dir(), "fivegib", key.as_str()))
+        .await
+        .unwrap();
+    let mut first = [0u8; 1];
+    object.read_exact(&mut first).await.unwrap();
+    assert_eq!(first[0], 1);
+
+    object
+        .seek(SeekFrom::Start(TOTAL_SIZE - 1))
+        .await
+        .unwrap();
+    let mut last = [0u8; 1];
+    object.read_exact(&mut last).await.unwrap();
+    assert_eq!(last[0], ((PART_COUNT - 1) % 251 + 1) as u8);
 }
 
 #[tokio::test]

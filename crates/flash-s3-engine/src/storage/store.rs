@@ -111,6 +111,7 @@ pub struct ObjectStore {
     data_dir: PathBuf,
     index: ObjectIndex,
     locks: Arc<DashMap<String, Arc<Mutex<()>>>>,
+    multipart_locks: Arc<DashMap<String, Arc<Mutex<()>>>>,
     metrics: Metrics,
 }
 
@@ -125,6 +126,7 @@ impl ObjectStore {
             data_dir,
             index,
             locks: Arc::new(DashMap::new()),
+            multipart_locks: Arc::new(DashMap::new()),
             metrics,
         })
     }
@@ -151,6 +153,15 @@ impl ObjectStore {
     fn lock_for(&self, bucket: &str, key: &str) -> Arc<Mutex<()>> {
         let k = format!("{bucket}/{key}");
         self.locks
+            .entry(k)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    /// Serialize mutations to one multipart upload's manifest.
+    fn multipart_lock_for(&self, bucket: &str, upload_id: &str) -> Arc<Mutex<()>> {
+        let k = format!("{bucket}/{upload_id}");
+        self.multipart_locks
             .entry(k)
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
@@ -569,6 +580,8 @@ impl ObjectStore {
         if !(1..=10000).contains(&part_number) {
             return Err(FlashError::InvalidRequest("invalid part number".into()));
         }
+        let lock = self.multipart_lock_for(bucket, upload_id);
+        let _guard = lock.lock().await;
         let dir = layout::multipart_dir(&self.data_dir, bucket, upload_id);
         let meta_path = dir.join("meta.json");
         if !meta_path.exists() {
@@ -598,6 +611,8 @@ impl ObjectStore {
         parts: &[(i32, String)],
         default_object_acl: CannedAcl,
     ) -> Result<ObjectMeta, FlashError> {
+        let multipart_lock = self.multipart_lock_for(bucket, upload_id);
+        let _multipart_guard = multipart_lock.lock().await;
         let dir = layout::multipart_dir(&self.data_dir, bucket, upload_id);
         let meta_path = dir.join("meta.json");
         if !meta_path.exists() {
@@ -688,6 +703,8 @@ impl ObjectStore {
     }
 
     pub async fn abort_multipart(&self, bucket: &str, upload_id: &str) -> Result<(), FlashError> {
+        let lock = self.multipart_lock_for(bucket, upload_id);
+        let _guard = lock.lock().await;
         let dir = layout::multipart_dir(&self.data_dir, bucket, upload_id);
         if !dir.exists() {
             return Err(FlashError::NoSuchUpload);
