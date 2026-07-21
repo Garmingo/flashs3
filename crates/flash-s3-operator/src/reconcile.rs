@@ -9,7 +9,7 @@ use flash_s3_common::{
     ENV_ACCESS_KEY, ENV_CACHE_MAX_BYTES, ENV_CACHE_OBJECT_MAX_BYTES, ENV_CACHE_POLICY,
     ENV_DATA_DIR, ENV_DEFAULT_BUCKET_NAME, ENV_DEFAULT_OBJECT_ACL, ENV_SECRET_KEY,
 };
-use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec};
+use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec, DeploymentStrategy};
 use k8s_openapi::api::core::v1::{
     Container, EnvVar, EnvVarSource, PersistentVolumeClaim, PersistentVolumeClaimSpec,
     PersistentVolumeClaimVolumeSource, PodSpec, PodTemplateSpec, Secret, SecretKeySelector,
@@ -245,6 +245,13 @@ async fn ensure_deployment(
         },
         spec: Some(DeploymentSpec {
             replicas: Some(1),
+            // The PVC is mounted read-write by one engine instance. Recreate
+            // prevents a rolling update from briefly running old and new pods
+            // against that same local store.
+            strategy: Some(DeploymentStrategy {
+                type_: Some("Recreate".into()),
+                ..Default::default()
+            }),
             selector: LabelSelector {
                 match_labels: Some(labels.clone()),
                 ..Default::default()
