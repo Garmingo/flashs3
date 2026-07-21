@@ -33,6 +33,9 @@ pub struct FlashS3BucketSpec {
     /// Default canned ACL for new objects (`private`, `public-read`, …).
     #[serde(default = "default_acl")]
     pub default_object_acl: String,
+    /// Optional S3 bucket created automatically when the engine starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_bucket_name: Option<String>,
     /// Cache settings mapped to `FLASHS3_CACHE_*` env vars.
     #[serde(default)]
     pub cache: CacheSpec,

@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use flash_s3_common::{
     ENV_ACCESS_KEY, ENV_CACHE_MAX_BYTES, ENV_CACHE_OBJECT_MAX_BYTES, ENV_CACHE_POLICY,
-    ENV_DATA_DIR, ENV_DEFAULT_OBJECT_ACL, ENV_SECRET_KEY,
+    ENV_DATA_DIR, ENV_DEFAULT_BUCKET_NAME, ENV_DEFAULT_OBJECT_ACL, ENV_SECRET_KEY,
 };
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec};
 use k8s_openapi::api::core::v1::{
@@ -217,6 +217,24 @@ async fn ensure_deployment(
 ) -> Result<(), Error> {
     let api: Api<Deployment> = Api::namespaced(client.clone(), ns);
     let labels = labels(name);
+    let mut container_env = vec![
+        env(ENV_DATA_DIR, "/data"),
+        env(ENV_CACHE_POLICY, &bucket.spec.cache.policy),
+        env(
+            ENV_CACHE_MAX_BYTES,
+            &bucket.spec.cache.max_size_in_bytes.to_string(),
+        ),
+        env(
+            ENV_CACHE_OBJECT_MAX_BYTES,
+            &bucket.spec.cache.object_max_size_in_bytes.to_string(),
+        ),
+        env(ENV_DEFAULT_OBJECT_ACL, &bucket.spec.default_object_acl),
+        env_from_secret(ENV_ACCESS_KEY, secret_name, "accessKey"),
+        env_from_secret(ENV_SECRET_KEY, secret_name, "secretKey"),
+    ];
+    if let Some(default_bucket_name) = &bucket.spec.default_bucket_name {
+        container_env.push(env(ENV_DEFAULT_BUCKET_NAME, default_bucket_name));
+    }
     let deploy = Deployment {
         metadata: ObjectMeta {
             name: Some(name.to_string()),
@@ -245,21 +263,7 @@ async fn ensure_deployment(
                             name: Some("s3".into()),
                             ..Default::default()
                         }]),
-                        env: Some(vec![
-                            env(ENV_DATA_DIR, "/data"),
-                            env(ENV_CACHE_POLICY, &bucket.spec.cache.policy),
-                            env(
-                                ENV_CACHE_MAX_BYTES,
-                                &bucket.spec.cache.max_size_in_bytes.to_string(),
-                            ),
-                            env(
-                                ENV_CACHE_OBJECT_MAX_BYTES,
-                                &bucket.spec.cache.object_max_size_in_bytes.to_string(),
-                            ),
-                            env(ENV_DEFAULT_OBJECT_ACL, &bucket.spec.default_object_acl),
-                            env_from_secret(ENV_ACCESS_KEY, secret_name, "accessKey"),
-                            env_from_secret(ENV_SECRET_KEY, secret_name, "secretKey"),
-                        ]),
+                        env: Some(container_env),
                         volume_mounts: Some(vec![VolumeMount {
                             name: "data".into(),
                             mount_path: "/data".into(),

@@ -21,6 +21,20 @@ async fn health_and_ready() {
 }
 
 #[tokio::test]
+async fn configured_default_bucket_is_created_idempotently() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = common::test_config(tmp.path().to_path_buf());
+    config.default_bucket_name = Some("bootstrap".into());
+    let state = flash_s3_engine::AppState::new(config).unwrap();
+
+    state.initialize_default_bucket().await.unwrap();
+    state.initialize_default_bucket().await.unwrap();
+
+    let bucket = state.store.get_bucket("bootstrap").await.unwrap();
+    assert_eq!(bucket.name, "bootstrap");
+}
+
+#[tokio::test]
 async fn bucket_object_crud_via_http() {
     let tmp = tempfile::tempdir().unwrap();
     let state = app_state(&tmp);

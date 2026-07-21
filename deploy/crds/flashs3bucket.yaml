@@ -53,6 +53,8 @@ spec:
                   type: string
                   default: private
                   enum: [private, public-read, public-read-write, authenticated-read]
+                defaultBucketName:
+                  type: string
                 cache:
                   type: object
                   properties:

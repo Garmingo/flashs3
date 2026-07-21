@@ -7,6 +7,8 @@ spec:
   size: 50Gi
   # storageClassName: longhorn
   image: registry.garmingo.net/garmingo/flashs3/engine:latest
+  # Created automatically on engine startup.
+  defaultBucketName: media-assets
   defaultObjectAcl: private
   cache:
     policy: InMemoryLRU

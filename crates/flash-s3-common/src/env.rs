@@ -28,6 +28,8 @@ pub const ENV_REGION: &str = "FLASHS3_REGION";
 pub const ENV_AUTH_REQUIRED: &str = "FLASHS3_AUTH_REQUIRED";
 /// Default canned ACL applied to new objects without `x-amz-acl`.
 pub const ENV_DEFAULT_OBJECT_ACL: &str = "FLASHS3_DEFAULT_OBJECT_ACL";
+/// Optional S3 bucket created idempotently when the engine starts.
+pub const ENV_DEFAULT_BUCKET_NAME: &str = "FLASHS3_DEFAULT_BUCKET_NAME";
 /// When true, root API keys bypass ACL/policy checks (break-glass admin).
 pub const ENV_ROOT_BYPASSES_ACL: &str = "FLASHS3_ROOT_BYPASSES_ACL";
 

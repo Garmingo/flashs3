@@ -29,6 +29,10 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let state = AppState::new(config).context("failed to initialize engine")?;
+    state
+        .initialize_default_bucket()
+        .await
+        .context("failed to initialize default bucket")?;
     let bind = state.config.bind.clone();
     let app = router(state);
 

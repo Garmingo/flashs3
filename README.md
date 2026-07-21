@@ -141,6 +141,8 @@ spec:
   size: 50Gi
   # storageClassName: longhorn
   image: registry.garmingo.net/garmingo/flashs3/engine:latest
+  # Created automatically when the engine starts.
+  defaultBucketName: media-assets
   defaultObjectAcl: private
   cache:
     policy: InMemoryLRU
@@ -152,7 +154,7 @@ spec:
   retainPvc: true
 ```
 
-Credentials: if `spec.auth.secretRef` is omitted, the operator creates a Secret containing root keys. The resulting endpoint is, for example, `http://media.default.svc:9000`.
+Credentials: if `spec.auth.secretRef` is omitted, the operator creates a Secret containing root keys. `spec.defaultBucketName` is optional; when set, the engine creates that bucket idempotently on startup. The resulting endpoint is, for example, `http://media.default.svc:9000`.
 
 ## Env
 
@@ -167,6 +169,7 @@ Credentials: if `spec.auth.secretRef` is omitted, the operator creates a Secret 
 | `FLASHS3_CREDENTIALS_KEY` | Optional — encrypts secrets in `credentials.json` (AES-256-GCM); plaintext when unset |
 | `FLASHS3_REGION` | `us-east-1` |
 | `FLASHS3_DEFAULT_OBJECT_ACL` | `private` |
+| `FLASHS3_DEFAULT_BUCKET_NAME` | Optional bucket created idempotently on startup |
 
 When `FLASHS3_CREDENTIALS_KEY` is set, each `secret_key` in `credentials.json` is stored as
 `enc:v1:…`. The same key is required on every start; losing it makes encrypted secrets unrecoverable.

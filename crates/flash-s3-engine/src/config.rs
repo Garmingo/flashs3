@@ -7,7 +7,8 @@ use flash_s3_common::{
     CacheConfig, CachePolicyKind, CannedAcl, DEFAULT_BIND, DEFAULT_CACHE_MAX_BYTES,
     DEFAULT_CACHE_OBJECT_MAX_BYTES, DEFAULT_REGION, ENV_ACCESS_KEY, ENV_AUTH_REQUIRED, ENV_BIND,
     ENV_CACHE_MAX_BYTES, ENV_CACHE_OBJECT_MAX_BYTES, ENV_CACHE_POLICY, ENV_CREDENTIALS_KEY,
-    ENV_DATA_DIR, ENV_DEFAULT_OBJECT_ACL, ENV_REGION, ENV_ROOT_BYPASSES_ACL, ENV_SECRET_KEY,
+    ENV_DATA_DIR, ENV_DEFAULT_BUCKET_NAME, ENV_DEFAULT_OBJECT_ACL, ENV_REGION,
+    ENV_ROOT_BYPASSES_ACL, ENV_SECRET_KEY,
 };
 
 /// Process configuration for `flash-s3-engine`.
@@ -70,6 +71,10 @@ pub struct Config {
     /// Default canned ACL for new objects.
     #[arg(long, env = ENV_DEFAULT_OBJECT_ACL, default_value = "private")]
     pub default_object_acl: String,
+
+    /// Optional bucket created idempotently during engine startup.
+    #[arg(long, env = ENV_DEFAULT_BUCKET_NAME)]
+    pub default_bucket_name: Option<String>,
 
     /// Allow root keys to bypass ACL/policy checks.
     #[arg(long, env = ENV_ROOT_BYPASSES_ACL, default_value_t = true)]

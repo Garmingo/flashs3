@@ -52,4 +52,38 @@ impl AppState {
             metrics,
         })
     }
+
+    /// Create the configured startup bucket, if any.
+    ///
+    /// The operation is idempotent so restarts retain the existing bucket and
+    /// its contents. A root credential is required to own the initial bucket.
+    pub async fn initialize_default_bucket(&self) -> Result<(), FlashError> {
+        let Some(name) = self.config.default_bucket_name.as_deref() else {
+            return Ok(());
+        };
+        let owner = self
+            .creds
+            .list()
+            .into_iter()
+            .find(|key| key.is_root)
+            .ok_or_else(|| {
+                FlashError::InvalidRequest(
+                    "FLASHS3_DEFAULT_BUCKET_NAME requires a bootstrap root credential".into(),
+                )
+            })?;
+
+        match self
+            .store
+            .create_bucket(
+                name,
+                owner.canonical_id,
+                &owner.display_name,
+                self.config.default_object_acl(),
+            )
+            .await
+        {
+            Ok(_) | Err(FlashError::BucketAlreadyOwnedByYou) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
 }

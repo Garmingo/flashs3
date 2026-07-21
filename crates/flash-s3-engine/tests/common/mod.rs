@@ -39,6 +39,7 @@ pub fn test_config(data_dir: PathBuf) -> Config {
         region: REGION.into(),
         auth_required: false,
         default_object_acl: "private".into(),
+        default_bucket_name: None,
         root_bypasses_acl: true,
     }
 }
