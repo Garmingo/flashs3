@@ -5,6 +5,7 @@ mod common;
 use std::collections::BTreeMap;
 
 use bytes::Bytes;
+use chrono::DateTime;
 use common::{anon_request, app_state, signed_request};
 use http::{Method, StatusCode};
 
@@ -74,6 +75,26 @@ async fn bucket_object_crud_via_http() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, payload);
+
+    let (status, headers, _) = signed_request(
+        &state,
+        Method::HEAD,
+        "/demo/hello.txt",
+        BTreeMap::new(),
+        Bytes::new(),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let last_modified = headers
+        .get("last-modified")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(
+        DateTime::parse_from_rfc2822(last_modified).is_ok(),
+        "Last-Modified must be an RFC 7231 HTTP-date: {last_modified}"
+    );
 
     let (status, _, body) = signed_request(
         &state,

@@ -13,6 +13,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get};
 use axum::Router;
 use bytes::Bytes;
+use chrono::DateTime;
 use flash_s3_common::{
     AccessControlPolicy, CannedAcl, FlashError, ObjectKey, Permission,
 };
@@ -1000,11 +1001,19 @@ fn object_response(meta: &crate::storage::ObjectMeta, body: Body, request_id: &s
         .header(header::CONTENT_TYPE, &meta.content_type)
         .header(header::CONTENT_LENGTH, meta.size)
         .header(header::ETAG, &meta.etag)
-        .header(header::LAST_MODIFIED, &meta.last_modified)
+        .header(header::LAST_MODIFIED, http_date(&meta.last_modified))
         .header("x-amz-request-id", request_id)
         .header("Accept-Ranges", "bytes")
         .body(body)
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+/// Convert persisted RFC3339 metadata into the HTTP-date syntax required by
+/// RFC 7231 and expected by S3 SDK deserializers.
+fn http_date(timestamp: &str) -> String {
+    DateTime::parse_from_rfc3339(timestamp)
+        .map(|date| date.format("%a, %d %b %Y %H:%M:%S GMT").to_string())
+        .unwrap_or_else(|_| "Thu, 01 Jan 1970 00:00:00 GMT".to_string())
 }
 
 fn xml_ok(body: String, request_id: &str) -> Response {
