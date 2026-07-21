@@ -16,8 +16,9 @@ use bytes::Bytes;
 use flash_s3_common::{
     AccessControlPolicy, CannedAcl, FlashError, ObjectKey, Permission,
 };
+use futures::TryStreamExt;
 use http_body_util::BodyExt;
-use tokio_util::io::ReaderStream;
+use tokio_util::io::{ReaderStream, StreamReader};
 use tower_http::catch_panic::CatchPanicLayer;
 use uuid::Uuid;
 
@@ -118,6 +119,58 @@ async fn dispatch_inner(
         Some(p) => format!("/{p}"),
         None => "/".to_string(),
     };
+    let has_object_key = path
+        .as_deref()
+        .map(|p| p.split('/').filter(|segment| !segment.is_empty()).count() > 1)
+        .unwrap_or(false);
+    let is_streaming_upload = method == Method::PUT
+        && has_object_key
+        && !headers.contains_key("x-amz-copy-source")
+        && !query_map.contains_key("acl")
+        && (query_map.contains_key("partNumber") || query_map.is_empty());
+
+    if is_streaming_upload
+        && (headers.contains_key("x-amz-content-sha256")
+            || query_map.contains_key("X-Amz-Signature"))
+    {
+        let payload_hash = headers
+            .get("x-amz-content-sha256")
+            .and_then(|v| v.to_str().ok())
+            .or_else(|| query_map.get("X-Amz-Content-Sha256").map(String::as_str))
+            .unwrap_or("UNSIGNED-PAYLOAD");
+        let ctx = authenticate(
+            &state,
+            &method,
+            &path_str,
+            &query_map,
+            &headers,
+            payload_hash,
+        )?;
+        let path = path.ok_or_else(|| FlashError::InvalidRequest("missing path".into()))?;
+        let mut segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+        if segments.is_empty() {
+            return Err(FlashError::InvalidRequest("empty path".into()));
+        }
+        let bucket = segments.remove(0).to_string();
+        let key_raw = segments.join("/");
+        if key_raw.is_empty() {
+            return Err(FlashError::InvalidRequest("missing object key".into()));
+        }
+        let key = ObjectKey::new(&key_raw).map_err(|_| FlashError::InvalidObjectName)?;
+        let stream = TryStreamExt::map_err(body.into_data_stream(), std::io::Error::other);
+        let reader = StreamReader::new(stream);
+        return object_ops_stream(
+            &state,
+            &ctx,
+            &bucket,
+            &key,
+            &query_map,
+            &headers,
+            reader,
+            request_id,
+        )
+        .await;
+    }
 
     let body_bytes = body
         .collect()
@@ -137,25 +190,14 @@ async fn dispatch_inner(
             }
         });
 
-    let auth = verify_request(
-        method.as_str(),
+    let ctx = authenticate(
+        &state,
+        &method,
         &path_str,
         &query_map,
         &headers,
         &payload_hash,
-        &state.config.region,
-        &state.creds,
     )?;
-
-    let ctx = match auth {
-        Some(a) => AuthContext::authenticated(a.key),
-        None => {
-            if state.config.auth_required && state.creds.has_any_keys() {
-                // allow anonymous only for public ACL paths later
-            }
-            AuthContext::anonymous()
-        }
-    };
 
     // Require auth for mutating service ops when keys exist
     if path.is_none() && method == Method::GET {
@@ -194,6 +236,29 @@ async fn dispatch_inner(
         request_id,
     )
     .await
+}
+
+fn authenticate(
+    state: &AppState,
+    method: &Method,
+    path: &str,
+    query: &BTreeMap<String, String>,
+    headers: &HeaderMap,
+    payload_hash: &str,
+) -> Result<AuthContext, FlashError> {
+    let auth = verify_request(
+        method.as_str(),
+        path,
+        query,
+        headers,
+        payload_hash,
+        &state.config.region,
+        &state.creds,
+    )?;
+    Ok(match auth {
+        Some(a) => AuthContext::authenticated(a.key),
+        None => AuthContext::anonymous(),
+    })
 }
 
 async fn list_buckets(
@@ -485,6 +550,37 @@ async fn object_ops(
     }
 }
 
+async fn object_ops_stream(
+    state: &AppState,
+    ctx: &AuthContext,
+    bucket: &str,
+    key: &ObjectKey,
+    query: &BTreeMap<String, String>,
+    headers: &HeaderMap,
+    reader: impl tokio::io::AsyncRead + Unpin,
+    request_id: &str,
+) -> Result<Response, FlashError> {
+    if let Some(upload_id) = query.get("uploadId") {
+        if query.contains_key("partNumber") {
+            let part_number: i32 = query
+                .get("partNumber")
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| FlashError::InvalidRequest("partNumber".into()))?;
+            return upload_part_stream(
+                state,
+                ctx,
+                bucket,
+                upload_id,
+                part_number,
+                reader,
+                request_id,
+            )
+            .await;
+        }
+    }
+    put_object_stream(state, ctx, bucket, key, reader, headers, request_id).await
+}
+
 async fn put_object(
     state: &AppState,
     ctx: &AuthContext,
@@ -550,6 +646,62 @@ async fn put_object(
         state.cache.invalidate(bucket, key.as_str()).await;
     }
 
+    state.metrics.s3_requests.with_label_values(&["PUT", "200", "PutObject"]).inc();
+    Ok(etag_ok(&meta.etag, request_id))
+}
+
+async fn put_object_stream(
+    state: &AppState,
+    ctx: &AuthContext,
+    bucket: &str,
+    key: &ObjectKey,
+    reader: impl tokio::io::AsyncRead + Unpin,
+    headers: &HeaderMap,
+    request_id: &str,
+) -> Result<Response, FlashError> {
+    let info = state.store.get_bucket(bucket).await?;
+    let policy = state.store.load_policy(bucket).await?;
+    let object = if ctx.is_authenticated() {
+        state.store.get_object_meta(bucket, key).await.ok()
+    } else {
+        None
+    };
+    state.authorizer.authorize(
+        ctx,
+        S3Action::PutObject,
+        Some(&info),
+        object.as_ref(),
+        policy.as_ref(),
+    )?;
+
+    let owner = ctx.key.as_ref().ok_or(FlashError::AccessDenied)?;
+    let canned = headers
+        .get("x-amz-acl")
+        .and_then(|v| v.to_str().ok())
+        .and_then(CannedAcl::parse);
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let opts = PutObjectOpts {
+        content_type,
+        canned_acl: canned,
+        acl: None,
+        owner: owner.canonical_id.clone(),
+        owner_display_name: owner.display_name.clone(),
+        default_object_acl: info.default_object_acl,
+        user_meta: extract_user_meta(headers),
+    };
+    let meta = state
+        .store
+        .put_object_stream(bucket, key, reader, opts)
+        .await?;
+    if meta.size <= state.cache.object_max_bytes() {
+        let (_, body) = state.store.read_object_bytes(bucket, key).await?;
+        state.cache.insert(bucket, key.as_str(), body).await;
+    } else {
+        state.cache.invalidate(bucket, key.as_str()).await;
+    }
     state.metrics.s3_requests.with_label_values(&["PUT", "200", "PutObject"]).inc();
     Ok(etag_ok(&meta.etag, request_id))
 }
@@ -790,6 +942,25 @@ async fn upload_part(
     let etag = state
         .store
         .upload_part(bucket, upload_id, part_number, body)
+        .await?;
+    Ok(etag_ok(&etag, request_id))
+}
+
+async fn upload_part_stream(
+    state: &AppState,
+    ctx: &AuthContext,
+    bucket: &str,
+    upload_id: &str,
+    part_number: i32,
+    reader: impl tokio::io::AsyncRead + Unpin,
+    request_id: &str,
+) -> Result<Response, FlashError> {
+    if !ctx.is_authenticated() {
+        return Err(FlashError::AccessDenied);
+    }
+    let etag = state
+        .store
+        .upload_part_stream(bucket, upload_id, part_number, reader)
         .await?;
     Ok(etag_ok(&etag, request_id))
 }

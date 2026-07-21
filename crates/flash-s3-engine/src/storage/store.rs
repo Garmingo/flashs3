@@ -112,6 +112,7 @@ pub struct ObjectStore {
     index: ObjectIndex,
     locks: Arc<DashMap<String, Arc<Mutex<()>>>>,
     multipart_locks: Arc<DashMap<String, Arc<Mutex<()>>>>,
+    multipart_part_locks: Arc<DashMap<String, Arc<Mutex<()>>>>,
     metrics: Metrics,
 }
 
@@ -127,6 +128,7 @@ impl ObjectStore {
             index,
             locks: Arc::new(DashMap::new()),
             multipart_locks: Arc::new(DashMap::new()),
+            multipart_part_locks: Arc::new(DashMap::new()),
             metrics,
         })
     }
@@ -162,6 +164,21 @@ impl ObjectStore {
     fn multipart_lock_for(&self, bucket: &str, upload_id: &str) -> Arc<Mutex<()>> {
         let k = format!("{bucket}/{upload_id}");
         self.multipart_locks
+            .entry(k)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    /// Serialize replacement writes to one part number while allowing different
+    /// parts of the same upload to stream concurrently.
+    fn multipart_part_lock_for(
+        &self,
+        bucket: &str,
+        upload_id: &str,
+        part_number: i32,
+    ) -> Arc<Mutex<()>> {
+        let k = format!("{bucket}/{upload_id}/{part_number}");
+        self.multipart_part_locks
             .entry(k)
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
@@ -580,6 +597,79 @@ impl ObjectStore {
         if !(1..=10000).contains(&part_number) {
             return Err(FlashError::InvalidRequest("invalid part number".into()));
         }
+        let part_lock = self.multipart_part_lock_for(bucket, upload_id, part_number);
+        let _part_guard = part_lock.lock().await;
+        let dir = layout::multipart_dir(&self.data_dir, bucket, upload_id);
+        let meta_path = dir.join("meta.json");
+        if !meta_path.exists() {
+            return Err(FlashError::NoSuchUpload);
+        }
+        let part_path = dir.join(format!("part-{part_number}"));
+        atomic_write_bytes(&part_path, &body).await?;
+        let etag = md5_etag(&body);
+        self.commit_part(bucket, upload_id, part_number, etag.clone(), body.len() as u64)
+            .await?;
+        self.metrics.disk_write_bytes.inc_by(body.len() as u64);
+        Ok(etag)
+    }
+
+    /// Stream one multipart part to disk, returning its ETag without buffering
+    /// the whole part in memory.
+    pub async fn upload_part_stream(
+        &self,
+        bucket: &str,
+        upload_id: &str,
+        part_number: i32,
+        mut reader: impl tokio::io::AsyncRead + Unpin,
+    ) -> Result<String, FlashError> {
+        use tokio::io::AsyncReadExt;
+
+        if !(1..=10000).contains(&part_number) {
+            return Err(FlashError::InvalidRequest("invalid part number".into()));
+        }
+        let part_lock = self.multipart_part_lock_for(bucket, upload_id, part_number);
+        let _part_guard = part_lock.lock().await;
+        let dir = layout::multipart_dir(&self.data_dir, bucket, upload_id);
+        let meta_path = dir.join("meta.json");
+        if !meta_path.exists() {
+            return Err(FlashError::NoSuchUpload);
+        }
+        let part_path = dir.join(format!("part-{part_number}"));
+        let tmp = part_path.with_extension(format!("tmp-{}", Uuid::new_v4()));
+        let mut hasher = Md5::new();
+        let mut size = 0u64;
+        {
+            let mut file = tokio::fs::File::create(&tmp).await.map_err(io_err)?;
+            let mut buffer = vec![0u8; 256 * 1024];
+            loop {
+                let read = reader.read(&mut buffer).await.map_err(io_err)?;
+                if read == 0 {
+                    break;
+                }
+                file.write_all(&buffer[..read]).await.map_err(io_err)?;
+                hasher.update(&buffer[..read]);
+                size += read as u64;
+            }
+            file.flush().await.map_err(io_err)?;
+            file.sync_all().await.map_err(io_err)?;
+        }
+        tokio::fs::rename(&tmp, &part_path).await.map_err(io_err)?;
+        let etag = format!("\"{}\"", hex::encode(hasher.finalize()));
+        self.commit_part(bucket, upload_id, part_number, etag.clone(), size)
+            .await?;
+        self.metrics.disk_write_bytes.inc_by(size);
+        Ok(etag)
+    }
+
+    /// Atomically add or replace a committed part in the upload manifest.
+    async fn commit_part(
+        &self,
+        bucket: &str,
+        upload_id: &str,
+        part_number: i32,
+        etag: String,
+        size: u64,
+    ) -> Result<(), FlashError> {
         let lock = self.multipart_lock_for(bucket, upload_id);
         let _guard = lock.lock().await;
         let dir = layout::multipart_dir(&self.data_dir, bucket, upload_id);
@@ -588,19 +678,14 @@ impl ObjectStore {
             return Err(FlashError::NoSuchUpload);
         }
         let mut meta: MultipartMeta = read_json(&meta_path).await?;
-        let part_path = dir.join(format!("part-{part_number}"));
-        atomic_write_bytes(&part_path, &body).await?;
-        let etag = md5_etag(&body);
         meta.parts.retain(|p| p.part_number != part_number);
         meta.parts.push(MultipartPart {
             part_number,
-            etag: etag.clone(),
-            size: body.len() as u64,
+            etag,
+            size,
         });
         meta.parts.sort_by_key(|p| p.part_number);
-        atomic_write_json(&meta_path, &meta).await?;
-        self.metrics.disk_write_bytes.inc_by(body.len() as u64);
-        Ok(etag)
+        atomic_write_json(&meta_path, &meta).await
     }
 
     /// Concatenate parts in order into the final object and drop staging data.

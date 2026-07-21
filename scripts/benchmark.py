@@ -76,7 +76,14 @@ class S3Client:
         parsed = urllib.parse.urlsplit(self.base)
         self.host = parsed.netloc
 
-    def _headers(self, method: str, path: str, payload: bytes, extra: dict | None = None) -> dict:
+    def _headers(
+        self,
+        method: str,
+        path: str,
+        payload: bytes,
+        extra: dict | None = None,
+        query: dict[str, str] | None = None,
+    ) -> dict:
         now = datetime.now(timezone.utc)
         amz_date = now.strftime("%Y%m%dT%H%M%SZ")
         date_stamp = now.strftime("%Y%m%d")
@@ -87,8 +94,11 @@ class S3Client:
             f"x-amz-date:{amz_date}\n"
         )
         signed_headers = "host;x-amz-content-sha256;x-amz-date"
+        canonical_query = "&".join(
+            f"{uri_encode(k)}={uri_encode(v)}" for k, v in sorted((query or {}).items())
+        )
         canonical_request = (
-            f"{method}\n{path}\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
+            f"{method}\n{path}\n{canonical_query}\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
         )
         scope = f"{date_stamp}/{REGION}/s3/aws4_request"
         sts = (
@@ -113,19 +123,40 @@ class S3Client:
             headers.update(extra)
         return headers
 
-    def request(self, method: str, path: str, data: bytes = b"", extra: dict | None = None) -> tuple[int, bytes, float]:
-        headers = self._headers(method, path, data, extra)
+    def request(
+        self,
+        method: str,
+        path: str,
+        data: bytes = b"",
+        extra: dict | None = None,
+        query: dict[str, str] | None = None,
+    ) -> tuple[int, bytes, float]:
+        status, payload, _, dt = self.request_with_headers(method, path, data, extra, query)
+        return status, payload, dt
+
+    def request_with_headers(
+        self,
+        method: str,
+        path: str,
+        data: bytes = b"",
+        extra: dict | None = None,
+        query: dict[str, str] | None = None,
+    ) -> tuple[int, bytes, dict, float]:
+        headers = self._headers(method, path, data, extra, query)
         body = data if method in ("PUT", "POST") else None
-        req = urllib.request.Request(self.base + path, data=body, method=method, headers=headers)
+        url = self.base + path
+        if query:
+            url += "?" + urllib.parse.urlencode(query)
+        req = urllib.request.Request(url, data=body, method=method, headers=headers)
         t0 = time.perf_counter()
         try:
             with urllib.request.urlopen(req, timeout=120) as resp:
                 payload = resp.read()
                 dt = time.perf_counter() - t0
-                return resp.status, payload, dt
+                return resp.status, payload, dict(resp.headers), dt
         except urllib.error.HTTPError as e:
             dt = time.perf_counter() - t0
-            return e.code, e.read(), dt
+            return e.code, e.read(), dict(e.headers), dt
 
 
 def percentile(sorted_vals: list[float], p: float) -> float:
@@ -183,6 +214,71 @@ def run_ops(
         name=name,
         ops=ok,
         bytes_total=bytes_total if work and work[0][0] == "PUT" else sum(len(b) for *_, b in work),
+        seconds=elapsed,
+        errors=errors,
+        latency_ms_p50=percentile(latencies, 50),
+        latency_ms_p90=percentile(latencies, 90),
+        latency_ms_p95=percentile(latencies, 95),
+        latency_ms_p99=percentile(latencies, 99),
+    )
+
+
+def run_multipart_upload(
+    client: S3Client, bucket: str, key: str, size: int, part_size: int, concurrency: int
+) -> BenchResult:
+    """Upload one object through the S3 multipart API and measure the full transaction."""
+    status, body, _, _ = client.request_with_headers(
+        "POST", f"/{bucket}/{key}", query={"uploads": ""}
+    )
+    if status >= 400:
+        raise RuntimeError(f"initiate multipart upload failed: {status} {body[:200]!r}")
+    upload_id = body.decode().split("<UploadId>", 1)[1].split("</UploadId>", 1)[0]
+    parts = [(number, min(part_size, size - offset)) for number, offset in enumerate(range(0, size, part_size), 1)]
+    latencies: list[float] = []
+    etags: list[tuple[int, str]] = []
+    errors = 0
+    t0 = time.perf_counter()
+
+    def upload_part(part: tuple[int, int]) -> tuple[int, str, float, int]:
+        number, length = part
+        payload = bytes([number % 251 + 1]) * length
+        status, _, headers, dt = client.request_with_headers(
+            "PUT",
+            f"/{bucket}/{key}",
+            payload,
+            query={"partNumber": str(number), "uploadId": upload_id},
+        )
+        return number, headers.get("etag", ""), dt, status
+
+    with ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
+        futures = [pool.submit(upload_part, part) for part in parts]
+        for future in as_completed(futures):
+            number, etag, dt, status = future.result()
+            latencies.append(dt * 1000.0)
+            if status >= 400 or not etag:
+                errors += 1
+            else:
+                etags.append((number, etag))
+
+    if errors == 0:
+        xml = "<CompleteMultipartUpload>" + "".join(
+            f"<Part><PartNumber>{number}</PartNumber><ETag>{etag}</ETag></Part>"
+            for number, etag in sorted(etags)
+        ) + "</CompleteMultipartUpload>"
+        status, _, _, complete_time = client.request_with_headers(
+            "POST",
+            f"/{bucket}/{key}",
+            xml.encode(),
+            query={"uploadId": upload_id},
+        )
+        latencies.append(complete_time * 1000.0)
+        errors += int(status >= 400)
+    elapsed = time.perf_counter() - t0
+    latencies.sort()
+    return BenchResult(
+        name="write_multipart",
+        ops=1 - int(errors > 0),
+        bytes_total=size if errors == 0 else 0,
         seconds=elapsed,
         errors=errors,
         latency_ms_p50=percentile(latencies, 50),
@@ -270,7 +366,11 @@ def main() -> int:
     )
     ap.add_argument("--cache-max-bytes", type=int, default=512 * 1024 * 1024)
     ap.add_argument("--json-out", type=str, default="", help="write results JSON to path")
+    ap.add_argument("--multipart-size", type=int, default=0, help="run one multipart upload of this size in bytes")
+    ap.add_argument("--multipart-part-size", type=int, default=16 * 1024 * 1024, help="multipart part size in bytes")
     args = ap.parse_args()
+    if args.multipart_size and not args.endpoint:
+        ap.error("--multipart-size requires --endpoint to avoid filling a temporary disk")
     # Apply latency profile defaults only when user kept stock defaults.
     if args.profile == "latency" and args.objects == 200 and args.size == 64 * 1024:
         args.objects = 2000
@@ -291,6 +391,19 @@ def main() -> int:
             print(f"  mode=attach  endpoint={endpoint}")
             client = S3Client(endpoint)
             ensure_bucket(client, "bench")
+
+            if args.multipart_size:
+                r = run_multipart_upload(
+                    client,
+                    "bench",
+                    "multipart.bin",
+                    args.multipart_size,
+                    args.multipart_part_size,
+                    args.concurrency,
+                )
+                results.append(r)
+                print_result(r)
+                return 0
 
             # WRITE
             work = [("PUT", f"/bench/{k}", payload) for k in keys]
