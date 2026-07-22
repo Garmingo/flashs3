@@ -19,6 +19,7 @@ use flash_s3_common::{
 };
 use futures::{StreamExt, TryStreamExt};
 use http_body_util::BodyExt;
+use tokio::io::AsyncReadExt;
 use tokio_util::io::{ReaderStream, StreamReader};
 use tower_http::catch_panic::CatchPanicLayer;
 use uuid::Uuid;
@@ -534,7 +535,7 @@ async fn object_ops(
             put_object(state, ctx, bucket, key, body, headers, request_id).await
         }
         Method::GET => get_object(state, ctx, bucket, key, headers, request_id).await,
-        Method::HEAD => head_object(state, ctx, bucket, key, request_id).await,
+        Method::HEAD => head_object(state, ctx, bucket, key, headers, request_id).await,
         Method::DELETE => {
             let info = state.store.get_bucket(bucket).await?;
             let meta = state.store.get_object_meta(bucket, key).await?;
@@ -736,13 +737,29 @@ async fn get_object(
         }
     }
 
+    let range = match requested_range(headers, meta.size) {
+        Ok(range) => range,
+        Err(RangeError::Multiple) => {
+            return Err(FlashError::InvalidRequest(
+                "multiple byte ranges are not supported".into(),
+            ));
+        }
+        Err(RangeError::Unsatisfiable) => {
+            return Ok(range_not_satisfiable_response(meta.size, request_id));
+        }
+    };
+
     // Cache hit for small objects
     if let Some(cached) = state.cache.get(bucket, key.as_str()).await {
         state.metrics.s3_requests.with_label_values(&["GET", "200", "GetObject"]).inc();
+        if let Some(range) = range {
+            let bytes = cached.slice(range.start as usize..=range.end as usize);
+            return Ok(partial_object_response(&meta, Body::from(bytes), range, request_id));
+        }
         return Ok(object_response(&meta, Body::from(cached), request_id));
     }
 
-    if meta.size <= state.cache.object_max_bytes() {
+    if range.is_none() && meta.size <= state.cache.object_max_bytes() {
         let (meta, file) = state.store.open_object_file(bucket, key).await?;
         let cache = state.cache.clone();
         let bucket = bucket.to_string();
@@ -776,12 +793,26 @@ async fn get_object(
         return Ok(object_response(&meta, Body::from_stream(stream), request_id));
     }
 
-    let (meta, file) = state.store.open_object_file(bucket, key).await?;
-    let stream = ReaderStream::new(file);
+    let (file, response_size) = if let Some(range) = range {
+        (
+            state
+                .store
+                .open_object_range_file(bucket, key, range.start)
+                .await?,
+            range.len(),
+        )
+    } else {
+        (state.store.open_object_file(bucket, key).await?.1, meta.size)
+    };
+    let stream = ReaderStream::new(file.take(response_size));
     let body = Body::from_stream(stream);
-    state.metrics.disk_read_bytes.inc_by(meta.size);
+    state.metrics.disk_read_bytes.inc_by(response_size);
     state.metrics.s3_requests.with_label_values(&["GET", "200", "GetObject"]).inc();
-    Ok(object_response(&meta, body, request_id))
+    if let Some(range) = range {
+        Ok(partial_object_response(&meta, body, range, request_id))
+    } else {
+        Ok(object_response(&meta, body, request_id))
+    }
 }
 
 async fn head_object(
@@ -789,6 +820,7 @@ async fn head_object(
     ctx: &AuthContext,
     bucket: &str,
     key: &ObjectKey,
+    headers: &HeaderMap,
     request_id: &str,
 ) -> Result<Response, FlashError> {
     let info = state.store.get_bucket(bucket).await?;
@@ -802,7 +834,19 @@ async fn head_object(
         policy.as_ref(),
     )?;
     state.metrics.s3_requests.with_label_values(&["HEAD", "200", "HeadObject"]).inc();
-    Ok(object_response(&meta, Body::empty(), request_id))
+    match requested_range(headers, meta.size) {
+        Ok(Some(range)) => Ok(partial_object_response(
+            &meta,
+            Body::empty(),
+            range,
+            request_id,
+        )),
+        Ok(None) => Ok(object_response(&meta, Body::empty(), request_id)),
+        Err(RangeError::Multiple) => Err(FlashError::InvalidRequest(
+            "multiple byte ranges are not supported".into(),
+        )),
+        Err(RangeError::Unsatisfiable) => Ok(range_not_satisfiable_response(meta.size, request_id)),
+    }
 }
 
 async fn copy_object(
@@ -1023,16 +1067,111 @@ async fn complete_multipart(
 }
 
 fn object_response(meta: &crate::storage::ObjectMeta, body: Body, request_id: &str) -> Response {
-    Response::builder()
-        .status(StatusCode::OK)
+    object_response_with_status(meta, body, StatusCode::OK, meta.size, None, request_id)
+}
+
+fn partial_object_response(
+    meta: &crate::storage::ObjectMeta,
+    body: Body,
+    range: ByteRange,
+    request_id: &str,
+) -> Response {
+    let content_range = format!("bytes {}-{}/{}", range.start, range.end, meta.size);
+    object_response_with_status(
+        meta,
+        body,
+        StatusCode::PARTIAL_CONTENT,
+        range.len(),
+        Some(content_range),
+        request_id,
+    )
+}
+
+fn object_response_with_status(
+    meta: &crate::storage::ObjectMeta,
+    body: Body,
+    status: StatusCode,
+    content_length: u64,
+    content_range: Option<String>,
+    request_id: &str,
+) -> Response {
+    let mut builder = Response::builder()
+        .status(status)
         .header(header::CONTENT_TYPE, &meta.content_type)
-        .header(header::CONTENT_LENGTH, meta.size)
+        .header(header::CONTENT_LENGTH, content_length)
         .header(header::ETAG, &meta.etag)
         .header(header::LAST_MODIFIED, http_date(&meta.last_modified))
         .header("x-amz-request-id", request_id)
-        .header("Accept-Ranges", "bytes")
+        .header("Accept-Ranges", "bytes");
+    if let Some(content_range) = content_range {
+        builder = builder.header(header::CONTENT_RANGE, content_range);
+    }
+    builder
         .body(body)
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+fn range_not_satisfiable_response(size: u64, request_id: &str) -> Response {
+    Response::builder()
+        .status(StatusCode::RANGE_NOT_SATISFIABLE)
+        .header(header::CONTENT_RANGE, format!("bytes */{size}"))
+        .header("x-amz-request-id", request_id)
+        .body(Body::empty())
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+#[derive(Clone, Copy)]
+struct ByteRange {
+    start: u64,
+    end: u64,
+}
+
+impl ByteRange {
+    fn len(self) -> u64 {
+        self.end - self.start + 1
+    }
+}
+
+enum RangeError {
+    Multiple,
+    Unsatisfiable,
+}
+
+fn requested_range(headers: &HeaderMap, size: u64) -> Result<Option<ByteRange>, RangeError> {
+    let Some(value) = headers.get(header::RANGE) else {
+        return Ok(None);
+    };
+    let value = value.to_str().map_err(|_| RangeError::Unsatisfiable)?;
+    let spec = value.strip_prefix("bytes=").ok_or(RangeError::Unsatisfiable)?;
+    if spec.contains(',') {
+        return Err(RangeError::Multiple);
+    }
+    let (start, end) = spec.split_once('-').ok_or(RangeError::Unsatisfiable)?;
+    if start.is_empty() {
+        let suffix: u64 = end.parse().map_err(|_| RangeError::Unsatisfiable)?;
+        if suffix == 0 || size == 0 {
+            return Err(RangeError::Unsatisfiable);
+        }
+        let length = suffix.min(size);
+        return Ok(Some(ByteRange {
+            start: size - length,
+            end: size - 1,
+        }));
+    }
+    let start: u64 = start.parse().map_err(|_| RangeError::Unsatisfiable)?;
+    if start >= size {
+        return Err(RangeError::Unsatisfiable);
+    }
+    let end = if end.is_empty() {
+        size - 1
+    } else {
+        let end: u64 = end.parse().map_err(|_| RangeError::Unsatisfiable)?;
+        if end < start {
+            return Err(RangeError::Unsatisfiable);
+        }
+        end.min(size - 1)
+    };
+    Ok(Some(ByteRange { start, end }))
 }
 
 /// Convert persisted RFC3339 metadata into the HTTP-date syntax required by

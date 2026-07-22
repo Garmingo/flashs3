@@ -16,7 +16,7 @@ use flash_s3_common::{
 };
 use md5::{Digest as Md5Digest, Md5};
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -491,6 +491,22 @@ impl ObjectStore {
             .await
             .map_err(io_err)?;
         Ok((meta, f))
+    }
+
+    /// Open an object file positioned at `start` for a byte-range response.
+    pub async fn open_object_range_file(
+        &self,
+        bucket: &str,
+        key: &ObjectKey,
+        start: u64,
+    ) -> Result<tokio::fs::File, FlashError> {
+        let mut file = tokio::fs::File::open(layout::data_path(&self.data_dir, bucket, key.as_str()))
+            .await
+            .map_err(io_err)?;
+        file.seek(std::io::SeekFrom::Start(start))
+            .await
+            .map_err(io_err)?;
+        Ok(file)
     }
 
     pub async fn delete_object(&self, bucket: &str, key: &ObjectKey) -> Result<(), FlashError> {

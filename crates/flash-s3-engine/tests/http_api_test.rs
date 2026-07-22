@@ -392,6 +392,135 @@ async fn multipart_http() {
 }
 
 #[tokio::test]
+async fn get_and_head_object_support_single_byte_ranges() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = app_state(&tmp);
+    signed_request(
+        &state,
+        Method::PUT,
+        "/ranges",
+        BTreeMap::new(),
+        Bytes::new(),
+        &[],
+    )
+    .await;
+    let payload = Bytes::from_static(b"0123456789");
+    signed_request(
+        &state,
+        Method::PUT,
+        "/ranges/object.bin",
+        BTreeMap::new(),
+        payload.clone(),
+        &[],
+    )
+    .await;
+
+    // Force a cache miss: partial reads must stream only the requested bytes.
+    state.cache.invalidate("ranges", "object.bin").await;
+    let (status, headers, body) = signed_request(
+        &state,
+        Method::GET,
+        "/ranges/object.bin",
+        BTreeMap::new(),
+        Bytes::new(),
+        &[("range", "bytes=2-5")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+    assert_eq!(headers.get("content-range").unwrap(), "bytes 2-5/10");
+    assert_eq!(headers.get("content-length").unwrap(), "4");
+    assert_eq!(body.as_ref(), b"2345");
+
+    // Full GET fills the cache. A suffix range then slices cached bytes.
+    let (status, _, body) = signed_request(
+        &state,
+        Method::GET,
+        "/ranges/object.bin",
+        BTreeMap::new(),
+        Bytes::new(),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, payload);
+    let (status, headers, body) = signed_request(
+        &state,
+        Method::GET,
+        "/ranges/object.bin",
+        BTreeMap::new(),
+        Bytes::new(),
+        &[("range", "bytes=-3")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+    assert_eq!(headers.get("content-range").unwrap(), "bytes 7-9/10");
+    assert_eq!(body.as_ref(), b"789");
+
+    let (status, headers, body) = signed_request(
+        &state,
+        Method::HEAD,
+        "/ranges/object.bin",
+        BTreeMap::new(),
+        Bytes::new(),
+        &[("range", "bytes=6-")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+    assert_eq!(headers.get("content-range").unwrap(), "bytes 6-9/10");
+    assert_eq!(headers.get("content-length").unwrap(), "4");
+    assert!(body.is_empty());
+}
+
+#[tokio::test]
+async fn range_errors_return_expected_statuses() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = app_state(&tmp);
+    signed_request(
+        &state,
+        Method::PUT,
+        "/range-errors",
+        BTreeMap::new(),
+        Bytes::new(),
+        &[],
+    )
+    .await;
+    signed_request(
+        &state,
+        Method::PUT,
+        "/range-errors/object.bin",
+        BTreeMap::new(),
+        Bytes::from_static(b"0123456789"),
+        &[],
+    )
+    .await;
+
+    for value in ["bytes=10-", "bytes=5-2", "bytes=-0", "items=0-1"] {
+        let (status, headers, _) = signed_request(
+            &state,
+            Method::GET,
+            "/range-errors/object.bin",
+            BTreeMap::new(),
+            Bytes::new(),
+            &[("range", value)],
+        )
+        .await;
+        assert_eq!(status, StatusCode::RANGE_NOT_SATISFIABLE, "{value}");
+        assert_eq!(headers.get("content-range").unwrap(), "bytes */10");
+    }
+
+    let (status, _, _) = signed_request(
+        &state,
+        Method::GET,
+        "/range-errors/object.bin",
+        BTreeMap::new(),
+        Bytes::new(),
+        &[("range", "bytes=0-1,3-4")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn metrics_endpoint() {
     let tmp = tempfile::tempdir().unwrap();
     let state = app_state(&tmp);
