@@ -17,7 +17,7 @@ use chrono::DateTime;
 use flash_s3_common::{
     AccessControlPolicy, CannedAcl, FlashError, ObjectKey, Permission,
 };
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use http_body_util::BodyExt;
 use tokio_util::io::{ReaderStream, StreamReader};
 use tower_http::catch_panic::CatchPanicLayer;
@@ -743,10 +743,37 @@ async fn get_object(
     }
 
     if meta.size <= state.cache.object_max_bytes() {
-        let (meta, bytes) = state.store.read_object_bytes(bucket, key).await?;
-        state.cache.insert(bucket, key.as_str(), bytes.clone()).await;
+        let (meta, file) = state.store.open_object_file(bucket, key).await?;
+        let cache = state.cache.clone();
+        let bucket = bucket.to_string();
+        let key = key.as_str().to_string();
+        let stream = futures::stream::unfold(
+            (ReaderStream::new(file), Vec::new(), false),
+            move |(mut reader, mut buffered, failed)| {
+                let cache = cache.clone();
+                let bucket = bucket.clone();
+                let key = key.clone();
+                async move {
+                    if failed {
+                        return None;
+                    }
+                    match reader.next().await {
+                        Some(Ok(chunk)) => {
+                            buffered.extend_from_slice(&chunk);
+                            Some((Ok::<Bytes, std::io::Error>(chunk), (reader, buffered, false)))
+                        }
+                        Some(Err(error)) => Some((Err(error), (reader, buffered, true))),
+                        None => {
+                            cache.insert(&bucket, &key, Bytes::from(buffered)).await;
+                            None
+                        }
+                    }
+                }
+            },
+        );
+        state.metrics.disk_read_bytes.inc_by(meta.size);
         state.metrics.s3_requests.with_label_values(&["GET", "200", "GetObject"]).inc();
-        return Ok(object_response(&meta, Body::from(bytes), request_id));
+        return Ok(object_response(&meta, Body::from_stream(stream), request_id));
     }
 
     let (meta, file) = state.store.open_object_file(bucket, key).await?;
