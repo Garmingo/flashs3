@@ -6,8 +6,11 @@ use std::collections::BTreeMap;
 
 use bytes::Bytes;
 use chrono::DateTime;
-use common::{anon_request, app_state, signed_request};
-use http::{Method, StatusCode};
+use flash_s3_engine::api::router;
+use common::{anon_request, app_state, sign_headers, signed_request};
+use axum::body::Body;
+use http::{Method, Request, StatusCode};
+use tower::ServiceExt;
 
 #[tokio::test]
 async fn health_and_ready() {
@@ -108,6 +111,95 @@ async fn bucket_object_crud_via_http() {
     assert_eq!(status, StatusCode::OK);
     let xml = String::from_utf8_lossy(&body);
     assert!(xml.contains("<Key>hello.txt</Key>"));
+}
+
+#[tokio::test]
+async fn aws_chunked_put_stores_only_decoded_bytes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = app_state(&tmp);
+    signed_request(
+        &state,
+        Method::PUT,
+        "/chunked",
+        BTreeMap::new(),
+        Bytes::new(),
+        &[],
+    )
+    .await;
+
+    let wire = Bytes::from_static(b"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n");
+    let (status, _, _) = signed_request(
+        &state,
+        Method::PUT,
+        "/chunked/object.bin",
+        BTreeMap::new(),
+        wire,
+        &[
+            ("content-encoding", "aws-chunked"),
+            ("x-amz-decoded-content-length", "11"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, headers, body) = signed_request(
+        &state,
+        Method::GET,
+        "/chunked/object.bin",
+        BTreeMap::new(),
+        Bytes::new(),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, Bytes::from_static(b"hello world"));
+    assert_eq!(headers.get("content-encoding"), None);
+    assert_eq!(headers.get("content-length").unwrap(), "11");
+}
+
+#[tokio::test]
+async fn signed_payload_hash_mismatch_does_not_store_object() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = app_state(&tmp);
+    signed_request(
+        &state,
+        Method::PUT,
+        "/integrity",
+        BTreeMap::new(),
+        Bytes::new(),
+        &[],
+    )
+    .await;
+
+    let headers = sign_headers(
+        "PUT",
+        "/integrity/hash.bin",
+        &BTreeMap::new(),
+        b"expected bytes",
+        "127.0.0.1:9000",
+    );
+    let mut builder = Request::builder()
+        .method(Method::PUT)
+        .uri("/integrity/hash.bin");
+    for (name, value) in headers {
+        builder = builder.header(name, value);
+    }
+    let response = router(state.clone())
+        .oneshot(builder.body(Body::from("different bytes")).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let (status, _, _) = signed_request(
+        &state,
+        Method::GET,
+        "/integrity/hash.bin",
+        BTreeMap::new(),
+        Bytes::new(),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]

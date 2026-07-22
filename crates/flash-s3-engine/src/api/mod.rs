@@ -3,6 +3,7 @@
 //! Path-style routing: `/{bucket}` and `/{bucket}/{key…}` plus ops endpoints
 //! `/healthz`, `/readyz`, `/metrics`.
 
+mod aws_chunked;
 mod error;
 mod router;
 mod xml;

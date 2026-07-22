@@ -16,7 +16,7 @@ use flash_s3_common::{
 };
 use md5::{Digest as Md5Digest, Md5};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -52,6 +52,21 @@ pub struct ObjectMeta {
     pub etag: String,
     /// MIME type.
     pub content_type: String,
+    /// Additional representation coding, excluding the aws-chunked transport coding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_encoding: Option<String>,
+    /// Cache policy returned to object readers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<String>,
+    /// Suggested download presentation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_disposition: Option<String>,
+    /// Natural language of the representation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_language: Option<String>,
+    /// Expiration date supplied by the client.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires: Option<String>,
     /// Last modification time (RFC3339).
     pub last_modified: String,
     /// Object owner.
@@ -63,6 +78,9 @@ pub struct ObjectMeta {
     /// `x-amz-meta-*` user metadata.
     #[serde(default)]
     pub user_meta: std::collections::HashMap<String, String>,
+    /// Validated object checksums, keyed by the S3 response header name.
+    #[serde(default)]
+    pub checksums: std::collections::HashMap<String, String>,
 }
 
 /// Options for [`ObjectStore::put_object`] / copy / stream puts.
@@ -82,6 +100,14 @@ pub struct PutObjectOpts {
     pub default_object_acl: CannedAcl,
     /// User metadata map.
     pub user_meta: std::collections::HashMap<String, String>,
+    /// Standard object response metadata.
+    pub content_encoding: Option<String>,
+    pub cache_control: Option<String>,
+    pub content_disposition: Option<String>,
+    pub content_language: Option<String>,
+    pub expires: Option<String>,
+    /// Validated request checksum values.
+    pub checksums: std::collections::HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -342,11 +368,17 @@ impl ObjectStore {
             content_type: opts
                 .content_type
                 .unwrap_or_else(|| "application/octet-stream".into()),
+            content_encoding: opts.content_encoding,
+            cache_control: opts.cache_control,
+            content_disposition: opts.content_disposition,
+            content_language: opts.content_language,
+            expires: opts.expires,
             last_modified: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
             owner: opts.owner,
             owner_display_name: opts.owner_display_name,
             acl,
             user_meta: opts.user_meta,
+            checksums: opts.checksums,
         };
         atomic_write_json(&layout::meta_path(&self.data_dir, bucket, key.as_str()), &meta)
             .await?;
@@ -391,7 +423,7 @@ impl ObjectStore {
         let tmp = current.join(format!("data.{}.tmp", Uuid::new_v4()));
         let mut hasher = Md5::new();
         let mut size = 0u64;
-        {
+        let write_result: Result<(), FlashError> = async {
             let mut f = tokio::fs::File::create(&tmp).await.map_err(io_err)?;
             let mut buf = vec![0u8; 64 * 1024];
             loop {
@@ -405,6 +437,12 @@ impl ObjectStore {
             }
             f.flush().await.map_err(io_err)?;
             f.sync_all().await.map_err(io_err)?;
+            Ok(())
+        }
+        .await;
+        if let Err(error) = write_result {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(error);
         }
         let data_path = layout::data_path(&self.data_dir, bucket, key.as_str());
         tokio::fs::rename(&tmp, &data_path).await.map_err(io_err)?;
@@ -424,11 +462,17 @@ impl ObjectStore {
             content_type: opts
                 .content_type
                 .unwrap_or_else(|| "application/octet-stream".into()),
+            content_encoding: opts.content_encoding,
+            cache_control: opts.cache_control,
+            content_disposition: opts.content_disposition,
+            content_language: opts.content_language,
+            expires: opts.expires,
             last_modified: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
             owner: opts.owner,
             owner_display_name: opts.owner_display_name,
             acl,
             user_meta: opts.user_meta,
+            checksums: opts.checksums,
         };
         atomic_write_json(&layout::meta_path(&self.data_dir, bucket, key.as_str()), &meta)
             .await?;
@@ -567,8 +611,8 @@ impl ObjectStore {
         dst_key: &ObjectKey,
         opts: PutObjectOpts,
     ) -> Result<ObjectMeta, FlashError> {
-        let (_meta, bytes) = self.read_object_bytes(src_bucket, src_key).await?;
-        self.put_object(dst_bucket, dst_key, bytes, opts).await
+        let (_meta, file) = self.open_object_file(src_bucket, src_key).await?;
+        self.put_object_stream(dst_bucket, dst_key, file, opts).await
     }
 
     // --- Multipart -----------------------------------------------------------
@@ -654,7 +698,7 @@ impl ObjectStore {
         let tmp = part_path.with_extension(format!("tmp-{}", Uuid::new_v4()));
         let mut hasher = Md5::new();
         let mut size = 0u64;
-        {
+        let write_result: Result<(), FlashError> = async {
             let mut file = tokio::fs::File::create(&tmp).await.map_err(io_err)?;
             let mut buffer = vec![0u8; 256 * 1024];
             loop {
@@ -668,6 +712,12 @@ impl ObjectStore {
             }
             file.flush().await.map_err(io_err)?;
             file.sync_all().await.map_err(io_err)?;
+            Ok(())
+        }
+        .await;
+        if let Err(error) = write_result {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(error);
         }
         tokio::fs::rename(&tmp, &part_path).await.map_err(io_err)?;
         let etag = format!("\"{}\"", hex::encode(hasher.finalize()));
@@ -721,6 +771,27 @@ impl ObjectStore {
         }
         let meta: MultipartMeta = read_json(&meta_path).await?;
         let key = ObjectKey::new(&meta.key).map_err(|_| FlashError::InvalidObjectName)?;
+        if parts.is_empty() || parts.windows(2).any(|window| window[0].0 >= window[1].0) {
+            return Err(FlashError::InvalidPartOrder);
+        }
+        let selected_parts = parts
+            .iter()
+            .enumerate()
+            .map(|(index, (pn, etag))| {
+                let stored = meta
+                    .parts
+                    .iter()
+                    .find(|part| part.part_number == *pn)
+                    .ok_or(FlashError::InvalidPart)?;
+                if etag.trim_matches('"') != stored.etag.trim_matches('"') {
+                    return Err(FlashError::InvalidPart);
+                }
+                if index + 1 != parts.len() && stored.size < 5 * 1024 * 1024 {
+                    return Err(FlashError::EntityTooSmall);
+                }
+                Ok(stored.clone())
+            })
+            .collect::<Result<Vec<_>, FlashError>>()?;
 
         let lock = self.lock_for(bucket, key.as_str());
         let _guard = lock.lock().await;
@@ -730,44 +801,52 @@ impl ObjectStore {
             .await
             .map_err(io_err)?;
         let tmp = current.join(format!("data.{}.tmp", Uuid::new_v4()));
-        let mut hasher = Md5::new();
         let mut size = 0u64;
-        let mut part_etags = Vec::new();
-        {
+        let mut part_digests = Vec::with_capacity(selected_parts.len());
+        let write_result: Result<(), FlashError> = async {
             let mut out = tokio::fs::File::create(&tmp).await.map_err(io_err)?;
-            for (pn, etag) in parts {
-                let stored = meta
-                    .parts
-                    .iter()
-                    .find(|p| p.part_number == *pn)
-                    .ok_or(FlashError::InvalidPart)?;
-                let want = etag.trim_matches('"');
-                let have = stored.etag.trim_matches('"');
-                if want != have {
-                    return Err(FlashError::InvalidPart);
+            let mut buffer = vec![0u8; 256 * 1024];
+            for stored in &selected_parts {
+                let mut part = tokio::fs::File::open(
+                    dir.join(format!("part-{}", stored.part_number)),
+                )
+                .await
+                .map_err(io_err)?;
+                loop {
+                    let read = part.read(&mut buffer).await.map_err(io_err)?;
+                    if read == 0 {
+                        break;
+                    }
+                    out.write_all(&buffer[..read]).await.map_err(io_err)?;
+                    size += read as u64;
                 }
-                let bytes = tokio::fs::read(dir.join(format!("part-{pn}")))
-                    .await
-                    .map_err(io_err)?;
-                out.write_all(&bytes).await.map_err(io_err)?;
-                hasher.update(&bytes);
-                size += bytes.len() as u64;
-                part_etags.push(have.to_string());
+                let digest = hex::decode(stored.etag.trim_matches('"'))
+                    .map_err(|_| FlashError::Internal("invalid stored multipart ETag".into()))?;
+                if digest.len() != 16 {
+                    return Err(FlashError::Internal("invalid stored multipart ETag".into()));
+                }
+                part_digests.extend_from_slice(&digest);
             }
             out.flush().await.map_err(io_err)?;
             out.sync_all().await.map_err(io_err)?;
+            Ok(())
+        }
+        .await;
+        if let Err(error) = write_result {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(error);
         }
         let data_path = layout::data_path(&self.data_dir, bucket, key.as_str());
         tokio::fs::rename(&tmp, &data_path).await.map_err(io_err)?;
 
-        let etag = if part_etags.len() > 1 {
+        let etag = if selected_parts.len() > 1 {
             format!(
                 "\"{}-{}\"",
-                hex::encode(hasher.finalize()),
-                part_etags.len()
+                hex::encode(Md5::digest(&part_digests)),
+                selected_parts.len()
             )
         } else {
-            format!("\"{}\"", hex::encode(hasher.finalize()))
+            format!("\"{}\"", hex::encode(&part_digests))
         };
 
         let acl = AccessControlPolicy::from_canned(
@@ -782,11 +861,17 @@ impl ObjectStore {
             content_type: meta
                 .content_type
                 .unwrap_or_else(|| "application/octet-stream".into()),
+            content_encoding: None,
+            cache_control: None,
+            content_disposition: None,
+            content_language: None,
+            expires: None,
             last_modified: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
             owner: meta.owner,
             owner_display_name: meta.owner_display_name,
             acl,
             user_meta: Default::default(),
+            checksums: Default::default(),
         };
         atomic_write_json(&layout::meta_path(&self.data_dir, bucket, key.as_str()), &obj)
             .await?;
@@ -843,7 +928,11 @@ fn md5_etag(data: &[u8]) -> String {
 }
 
 fn io_err(e: std::io::Error) -> FlashError {
-    FlashError::Internal(e.to_string())
+    if e.kind() == std::io::ErrorKind::InvalidData {
+        FlashError::InvalidRequest(e.to_string())
+    } else {
+        FlashError::Internal(e.to_string())
+    }
 }
 
 /// Write `data` to `path` via temp file + fsync + rename (POSIX-atomic replace).

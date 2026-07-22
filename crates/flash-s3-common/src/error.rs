@@ -29,6 +29,12 @@ pub enum FlashError {
     /// SigV4 signature mismatch or malformed auth header.
     #[error("SignatureDoesNotMatch: The request signature we calculated does not match")]
     SignatureDoesNotMatch,
+    /// Content-MD5 or a declared object checksum did not match the payload.
+    #[error("BadDigest: The Content-MD5 you specified did not match what we received")]
+    BadDigest,
+    /// Signed SHA-256 payload hash did not match the received body.
+    #[error("XAmzContentSHA256Mismatch: The provided x-amz-content-sha256 does not match")]
+    ContentSha256Mismatch,
     /// Bucket name violates naming rules.
     #[error("InvalidBucketName: The specified bucket is not valid")]
     InvalidBucketName,
@@ -41,6 +47,9 @@ pub enum FlashError {
     /// Listed part missing or ETag mismatch on complete.
     #[error("InvalidPart: One or more of the specified parts could not be found")]
     InvalidPart,
+    /// Multipart completion list is not strictly ascending.
+    #[error("InvalidPartOrder: The list of parts was not in ascending order")]
+    InvalidPartOrder,
     /// Upload below minimum size (reserved for future strict checks).
     #[error("EntityTooSmall: Your proposed upload is smaller than the minimum allowed size")]
     EntityTooSmall,
@@ -75,10 +84,13 @@ impl FlashError {
             Self::AccessDenied => "AccessDenied",
             Self::InvalidAccessKeyId => "InvalidAccessKeyId",
             Self::SignatureDoesNotMatch => "SignatureDoesNotMatch",
+            Self::BadDigest => "BadDigest",
+            Self::ContentSha256Mismatch => "XAmzContentSHA256Mismatch",
             Self::InvalidBucketName => "InvalidBucketName",
             Self::InvalidObjectName => "InvalidObjectName",
             Self::NoSuchUpload => "NoSuchUpload",
             Self::InvalidPart => "InvalidPart",
+            Self::InvalidPartOrder => "InvalidPartOrder",
             Self::EntityTooSmall => "EntityTooSmall",
             Self::MalformedAcl => "MalformedACLError",
             Self::MalformedPolicy => "MalformedPolicy",

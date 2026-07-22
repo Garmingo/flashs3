@@ -23,6 +23,12 @@ fn opts(owner: &CanonicalUserId) -> PutObjectOpts {
         owner_display_name: "bench".into(),
         default_object_acl: CannedAcl::Private,
         user_meta: Default::default(),
+        content_encoding: None,
+        cache_control: None,
+        content_disposition: None,
+        content_language: None,
+        expires: None,
+        checksums: Default::default(),
     }
 }
 

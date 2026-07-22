@@ -11,6 +11,7 @@
 use flash_s3_common::{AccessControlPolicy, BucketPolicy, CanonicalUserId, FlashError, Permission};
 
 use super::credentials::StoredKey;
+use super::sigv4::ChunkSigning;
 use crate::storage::{BucketInfo, ObjectMeta};
 
 /// Authenticated (or anonymous) caller for a single request.
@@ -18,17 +19,33 @@ use crate::storage::{BucketInfo, ObjectMeta};
 pub struct AuthContext {
     /// Present when SigV4 succeeded.
     pub key: Option<StoredKey>,
+    /// Per-request key material for SigV4 streaming chunks.
+    pub streaming: Option<ChunkSigning>,
 }
 
 impl AuthContext {
     /// Anonymous (unsigned) caller.
     pub fn anonymous() -> Self {
-        Self { key: None }
+        Self {
+            key: None,
+            streaming: None,
+        }
     }
 
     /// Caller authenticated with `key`.
     pub fn authenticated(key: StoredKey) -> Self {
-        Self { key: Some(key) }
+        Self {
+            key: Some(key),
+            streaming: None,
+        }
+    }
+
+    /// Caller authenticated with streaming SigV4 context.
+    pub fn authenticated_streaming(key: StoredKey, streaming: Option<ChunkSigning>) -> Self {
+        Self {
+            key: Some(key),
+            streaming,
+        }
     }
 
     /// True when SigV4 produced a key.

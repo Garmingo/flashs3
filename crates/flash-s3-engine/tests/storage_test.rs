@@ -20,6 +20,12 @@ fn opts(owner: &CanonicalUserId) -> PutObjectOpts {
         owner_display_name: "root".into(),
         default_object_acl: CannedAcl::Private,
         user_meta: Default::default(),
+        content_encoding: None,
+        cache_control: None,
+        content_disposition: None,
+        content_language: None,
+        expires: None,
+        checksums: Default::default(),
     }
 }
 
@@ -105,7 +111,7 @@ async fn multipart_roundtrip() {
         .await
         .unwrap();
 
-    let p1 = Bytes::from(vec![1u8; 1024]);
+    let p1 = Bytes::from(vec![1u8; 5 * 1024 * 1024]);
     let p2 = Bytes::from(vec![2u8; 1024]);
     let e1 = store.upload_part("mparts", &upload_id, 1, p1.clone()).await.unwrap();
     let e2 = store.upload_part("mparts", &upload_id, 2, p2.clone()).await.unwrap();
@@ -119,11 +125,11 @@ async fn multipart_roundtrip() {
         )
         .await
         .unwrap();
-    assert_eq!(meta.size, 2048);
+    assert_eq!(meta.size, p1.len() as u64 + p2.len() as u64);
 
     let (_, data) = store.read_object_bytes("mparts", &key).await.unwrap();
-    assert_eq!(&data[..1024], &p1[..]);
-    assert_eq!(&data[1024..], &p2[..]);
+    assert_eq!(&data[..p1.len()], &p1[..]);
+    assert_eq!(&data[p1.len()..], &p2[..]);
 }
 
 #[tokio::test]
@@ -148,8 +154,8 @@ async fn multipart_parallel_parts_preserve_complete_manifest() {
         )
         .await
         .unwrap();
-    let part_count = 32;
-    let part_size = 128 * 1024;
+    let part_count = 4;
+    let part_size = 5 * 1024 * 1024;
 
     let uploads = (1..=part_count).map(|part_number| {
         let store = store.clone();

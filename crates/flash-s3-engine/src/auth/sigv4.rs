@@ -22,7 +22,47 @@ type HmacSha256 = Hmac<Sha256>;
 pub struct AuthResult {
     /// Resolved credential used to sign the request.
     pub key: StoredKey,
+    /// Present for header-authenticated SigV4 streaming requests.
+    pub streaming: Option<ChunkSigning>,
 }
+
+/// Material needed to validate the chained signatures in an aws-chunked body.
+///
+/// This is intentionally request-scoped and never persisted or logged.
+#[derive(Debug, Clone)]
+pub struct ChunkSigning {
+    signing_key: Vec<u8>,
+    amz_date: String,
+    scope: String,
+    previous_signature: String,
+}
+
+impl ChunkSigning {
+    /// Verify one payload chunk and advance the signature chain.
+    pub fn verify_chunk(
+        &mut self,
+        payload_hash: &str,
+        supplied_signature: &str,
+    ) -> Result<(), FlashError> {
+        let string_to_sign = format!(
+            "AWS4-HMAC-SHA256-PAYLOAD\n{}\n{}\n{}\n{}\n{}",
+            self.amz_date,
+            self.scope,
+            self.previous_signature,
+            EMPTY_SHA256,
+            payload_hash
+        );
+        let expected = hex::encode(hmac_sha256(&self.signing_key, string_to_sign.as_bytes()));
+        if !bool::from(expected.as_bytes().ct_eq(supplied_signature.as_bytes())) {
+            return Err(FlashError::SignatureDoesNotMatch);
+        }
+        self.previous_signature = supplied_signature.to_string();
+        Ok(())
+    }
+}
+
+const EMPTY_SHA256: &str =
+    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
 /// Verify SigV4 for an incoming request.
 ///
@@ -99,7 +139,15 @@ pub fn verify_request(
     if !bool::from(expected.as_bytes().ct_eq(signature.as_bytes())) {
         return Err(FlashError::SignatureDoesNotMatch);
     }
-    Ok(Some(AuthResult { key }))
+    let streaming = payload_hash.starts_with("STREAMING-AWS4-HMAC-SHA256-PAYLOAD").then(|| {
+        ChunkSigning {
+            signing_key: signing_key(&key.secret_key, date, cred_region, "s3"),
+            amz_date: amz_date.to_string(),
+            scope,
+            previous_signature: signature.to_string(),
+        }
+    });
+    Ok(Some(AuthResult { key, streaming }))
 }
 
 fn verify_presigned(
@@ -169,7 +217,10 @@ fn verify_presigned(
     if !bool::from(expected.as_bytes().ct_eq(signature.as_bytes())) {
         return Err(FlashError::SignatureDoesNotMatch);
     }
-    Ok(Some(AuthResult { key }))
+    Ok(Some(AuthResult {
+        key,
+        streaming: None,
+    }))
 }
 
 fn build_canonical_headers(headers: &HeaderMap, signed: &str) -> Result<String, FlashError> {
@@ -255,11 +306,15 @@ fn signing_signature(
     service: &str,
     string_to_sign: &str,
 ) -> String {
+    let k_signing = signing_key(secret, date, region, service);
+    hex::encode(hmac_sha256(&k_signing, string_to_sign.as_bytes()))
+}
+
+fn signing_key(secret: &str, date: &str, region: &str, service: &str) -> Vec<u8> {
     let k_date = hmac_sha256(format!("AWS4{secret}").as_bytes(), date.as_bytes());
     let k_region = hmac_sha256(&k_date, region.as_bytes());
     let k_service = hmac_sha256(&k_region, service.as_bytes());
-    let k_signing = hmac_sha256(&k_service, b"aws4_request");
-    hex::encode(hmac_sha256(&k_signing, string_to_sign.as_bytes()))
+    hmac_sha256(&k_service, b"aws4_request")
 }
 
 fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
@@ -283,7 +338,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        canonical_query_string, signing_signature, verify_request, CredentialStore, Sha256,
+        canonical_query_string, hmac_sha256, signing_key, signing_signature, verify_request,
+        ChunkSigning, CredentialStore, Sha256, EMPTY_SHA256,
     };
 
     const ACCESS_KEY: &str = "AKIDEXAMPLE";
@@ -448,5 +504,26 @@ mod tests {
 
         assert!(verify_request("PUT", path, &query, &raw_query, &headers, "", REGION, &creds)
             .is_err());
+    }
+
+    #[test]
+    fn validates_chained_streaming_chunk_signatures() {
+        let key = signing_key(SECRET_KEY, "20260722", REGION, "s3");
+        let mut signing = ChunkSigning {
+            signing_key: key.clone(),
+            amz_date: "20260722T120000Z".into(),
+            scope: format!("20260722/{REGION}/s3/aws4_request"),
+            previous_signature: "0".repeat(64),
+        };
+        let payload_hash = hex::encode(Sha256::digest(b"chunk bytes"));
+        let string_to_sign = format!(
+            "AWS4-HMAC-SHA256-PAYLOAD\n20260722T120000Z\n20260722/{REGION}/s3/aws4_request\n{}\n{}\n{}",
+            "0".repeat(64),
+            EMPTY_SHA256,
+            payload_hash
+        );
+        let signature = hex::encode(hmac_sha256(&key, string_to_sign.as_bytes()));
+        signing.verify_chunk(&payload_hash, &signature).unwrap();
+        assert!(signing.verify_chunk(&payload_hash, &"f".repeat(64)).is_err());
     }
 }

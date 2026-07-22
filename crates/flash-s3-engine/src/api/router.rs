@@ -12,19 +12,22 @@ use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode}
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get};
 use axum::Router;
-use bytes::Bytes;
+use base64::Engine;
+use bytes::{Bytes, BytesMut};
 use chrono::DateTime;
 use flash_s3_common::{
     AccessControlPolicy, CannedAcl, FlashError, ObjectKey, Permission,
 };
 use futures::{StreamExt, TryStreamExt};
-use http_body_util::BodyExt;
-use tokio::io::AsyncReadExt;
+use md5::Digest as Md5Digest;
+use sha2::Sha256;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio_util::io::{ReaderStream, StreamReader};
 use tower_http::catch_panic::CatchPanicLayer;
 use uuid::Uuid;
 
 use crate::api::error::{s3_error_response, xml_escape, ApiError};
+use crate::api::aws_chunked::{AwsChunkedConfig, AwsChunkedReader, PayloadHashReader};
 use crate::api::xml;
 use crate::auth::{hash_payload, verify_request, AuthContext, S3Action};
 use crate::server::AppState;
@@ -130,10 +133,18 @@ async fn dispatch_inner(
         && !headers.contains_key("x-amz-copy-source")
         && !query_map.contains_key("acl")
         && (query_map.contains_key("partNumber") || query_map.is_empty());
-
+    let aws_chunked = headers
+        .get(header::CONTENT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(',')
+                .any(|encoding| encoding.trim().eq_ignore_ascii_case("aws-chunked"))
+        });
     if is_streaming_upload
         && (headers.contains_key("x-amz-content-sha256")
-            || query_map.contains_key("X-Amz-Signature"))
+            || query_map.contains_key("X-Amz-Signature")
+            || aws_chunked)
     {
         let payload_hash = headers
             .get("x-amz-content-sha256")
@@ -161,7 +172,47 @@ async fn dispatch_inner(
         }
         let key = ObjectKey::new(&key_raw).map_err(|_| FlashError::InvalidObjectName)?;
         let stream = TryStreamExt::map_err(body.into_data_stream(), std::io::Error::other);
-        let reader = StreamReader::new(stream);
+        let raw_reader = StreamReader::new(stream);
+        let reader: Box<dyn AsyncRead + Send + Unpin> = if aws_chunked {
+            let decoded_length = headers
+                .get("x-amz-decoded-content-length")
+                .and_then(|value| value.to_str().ok())
+                .ok_or_else(|| FlashError::InvalidRequest("missing x-amz-decoded-content-length".into()))?
+                .parse()
+                .map_err(|_| FlashError::InvalidRequest("invalid x-amz-decoded-content-length".into()))?;
+            Box::new(AwsChunkedReader::new(
+                raw_reader,
+                AwsChunkedConfig {
+                    decoded_length: Some(decoded_length),
+                    require_chunk_signatures: payload_hash
+                        .starts_with("STREAMING-AWS4-HMAC-SHA256-PAYLOAD"),
+                    signing: ctx.streaming.clone(),
+                    required_trailers: headers
+                        .get("x-amz-trailer")
+                        .and_then(|value| value.to_str().ok())
+                        .map(|value| {
+                            value
+                                .split(',')
+                                .map(|name| name.trim().to_ascii_lowercase())
+                                .filter(|name| !name.is_empty())
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    expected_sha256_checksum: headers
+                        .get("x-amz-checksum-sha256")
+                        .and_then(|value| value.to_str().ok())
+                        .map(ToOwned::to_owned),
+                },
+            ))
+        } else {
+            let is_literal_hash = payload_hash.len() == 64
+                && payload_hash.bytes().all(|byte| byte.is_ascii_hexdigit());
+            if is_literal_hash {
+                Box::new(PayloadHashReader::new(raw_reader, payload_hash.to_string()))
+            } else {
+                Box::new(raw_reader)
+            }
+        };
         return object_ops_stream(
             &state,
             &ctx,
@@ -175,11 +226,7 @@ async fn dispatch_inner(
         .await;
     }
 
-    let body_bytes = body
-        .collect()
-        .await
-        .map_err(|e| FlashError::Internal(e.to_string()))?
-        .to_bytes();
+    let body_bytes = collect_control_body(body).await?;
 
     let payload_hash = headers
         .get("x-amz-content-sha256")
@@ -202,6 +249,7 @@ async fn dispatch_inner(
         &headers,
         &payload_hash,
     )?;
+    validate_buffered_integrity(&headers, &body_bytes)?;
 
     // Require auth for mutating service ops when keys exist
     if path.is_none() && method == Method::GET {
@@ -242,6 +290,64 @@ async fn dispatch_inner(
     .await
 }
 
+/// Collect only control-plane and fully signed non-streaming payloads. Object
+/// uploads with an unsigned or streaming payload are routed above and never
+/// pass through this bounded buffer.
+async fn collect_control_body(body: Body) -> Result<Bytes, FlashError> {
+    const MAX_BUFFERED_BODY: usize = 16 * 1024 * 1024;
+    let mut stream = body.into_data_stream();
+    let mut out = BytesMut::new();
+    while let Some(chunk) = stream
+        .try_next()
+        .await
+        .map_err(|error| FlashError::Internal(error.to_string()))?
+    {
+        if out.len().saturating_add(chunk.len()) > MAX_BUFFERED_BODY {
+            return Err(FlashError::InvalidRequest(
+                "request body exceeds the buffered operation limit".into(),
+            ));
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok(out.freeze())
+}
+
+fn validate_buffered_integrity(headers: &HeaderMap, body: &[u8]) -> Result<(), FlashError> {
+    if let Some(expected) = headers
+        .get("x-amz-content-sha256")
+        .and_then(|value| value.to_str().ok())
+    {
+        if !expected.starts_with("STREAMING-")
+            && expected != "UNSIGNED-PAYLOAD"
+            && expected != hash_payload(body)
+        {
+            return Err(FlashError::ContentSha256Mismatch);
+        }
+    }
+    if let Some(expected) = headers
+        .get("x-amz-checksum-sha256")
+        .and_then(|value| value.to_str().ok())
+    {
+        let actual = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(body));
+        if expected != actual {
+            return Err(FlashError::BadDigest);
+        }
+    }
+    if let Some(expected) = headers
+        .get("content-md5")
+        .and_then(|value| value.to_str().ok())
+    {
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(expected)
+            .map_err(|_| FlashError::BadDigest)?;
+        let digest = md5::Md5::digest(body);
+        if decoded.as_slice() != digest.as_slice() {
+            return Err(FlashError::BadDigest);
+        }
+    }
+    Ok(())
+}
+
 fn authenticate(
     state: &AppState,
     method: &Method,
@@ -262,7 +368,7 @@ fn authenticate(
         &state.creds,
     )?;
     Ok(match auth {
-        Some(a) => AuthContext::authenticated(a.key),
+        Some(a) => AuthContext::authenticated_streaming(a.key, a.streaming),
         None => AuthContext::anonymous(),
     })
 }
@@ -623,23 +729,7 @@ async fn put_object(
 
     let info = state.store.get_bucket(bucket).await?;
     let owner = ctx.key.as_ref().ok_or(FlashError::AccessDenied)?;
-    let canned = headers
-        .get("x-amz-acl")
-        .and_then(|v| v.to_str().ok())
-        .and_then(CannedAcl::parse);
-    let content_type = headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
-    let opts = PutObjectOpts {
-        content_type,
-        canned_acl: canned,
-        acl: None,
-        owner: owner.canonical_id.clone(),
-        owner_display_name: owner.display_name.clone(),
-        default_object_acl: info.default_object_acl,
-        user_meta: extract_user_meta(headers),
-    };
+    let opts = put_object_opts(headers, owner, info.default_object_acl);
 
     let meta = state
         .store
@@ -681,23 +771,7 @@ async fn put_object_stream(
     )?;
 
     let owner = ctx.key.as_ref().ok_or(FlashError::AccessDenied)?;
-    let canned = headers
-        .get("x-amz-acl")
-        .and_then(|v| v.to_str().ok())
-        .and_then(CannedAcl::parse);
-    let content_type = headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
-    let opts = PutObjectOpts {
-        content_type,
-        canned_acl: canned,
-        acl: None,
-        owner: owner.canonical_id.clone(),
-        owner_display_name: owner.display_name.clone(),
-        default_object_acl: info.default_object_acl,
-        user_meta: extract_user_meta(headers),
-    };
+    let opts = put_object_opts(headers, owner, info.default_object_acl);
     let meta = state
         .store
         .put_object_stream(bucket, key, reader, opts)
@@ -731,10 +805,8 @@ async fn get_object(
         policy.as_ref(),
     )?;
 
-    if let Some(inm) = headers.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok()) {
-        if inm.trim_matches('"') == meta.etag.trim_matches('"') || inm == meta.etag {
-            return Ok(StatusCode::NOT_MODIFIED.into_response());
-        }
+    if let Some(response) = conditional_object_response(&meta, headers, request_id) {
+        return Ok(response);
     }
 
     let range = match requested_range(headers, meta.size) {
@@ -833,6 +905,9 @@ async fn head_object(
         Some(&meta),
         policy.as_ref(),
     )?;
+    if let Some(response) = conditional_object_response(&meta, headers, request_id) {
+        return Ok(response);
+    }
     state.metrics.s3_requests.with_label_values(&["HEAD", "200", "HeadObject"]).inc();
     match requested_range(headers, meta.size) {
         Ok(Some(range)) => Ok(partial_object_response(
@@ -902,6 +977,12 @@ async fn copy_object(
         owner_display_name: owner.display_name.clone(),
         default_object_acl: dst_info.default_object_acl,
         user_meta: src_meta.user_meta.clone(),
+        content_encoding: src_meta.content_encoding.clone(),
+        cache_control: src_meta.cache_control.clone(),
+        content_disposition: src_meta.content_disposition.clone(),
+        content_language: src_meta.content_language.clone(),
+        expires: src_meta.expires.clone(),
+        checksums: src_meta.checksums.clone(),
     };
     let meta = state
         .store
@@ -1070,6 +1151,75 @@ fn object_response(meta: &crate::storage::ObjectMeta, body: Body, request_id: &s
     object_response_with_status(meta, body, StatusCode::OK, meta.size, None, request_id)
 }
 
+fn conditional_object_response(
+    meta: &crate::storage::ObjectMeta,
+    headers: &HeaderMap,
+    request_id: &str,
+) -> Option<Response> {
+    let etag_matches = |value: &str| {
+        value
+            .split(',')
+            .map(str::trim)
+            .any(|tag| tag == "*" || tag.trim_start_matches("W/") == meta.etag)
+    };
+    if let Some(value) = headers.get(header::IF_MATCH).and_then(|value| value.to_str().ok()) {
+        if !etag_matches(value) {
+            return Some(precondition_response(StatusCode::PRECONDITION_FAILED, meta, request_id));
+        }
+    } else if let Some(value) = headers
+        .get(header::IF_UNMODIFIED_SINCE)
+        .and_then(|value| value.to_str().ok())
+    {
+        if let (Ok(since), Ok(modified)) = (
+            DateTime::parse_from_rfc2822(value),
+            DateTime::parse_from_rfc3339(&meta.last_modified),
+        ) {
+            if modified > since {
+                return Some(precondition_response(
+                    StatusCode::PRECONDITION_FAILED,
+                    meta,
+                    request_id,
+                ));
+            }
+        }
+    }
+    if let Some(value) = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+    {
+        if etag_matches(value) {
+            return Some(precondition_response(StatusCode::NOT_MODIFIED, meta, request_id));
+        }
+    } else if let Some(value) = headers
+        .get(header::IF_MODIFIED_SINCE)
+        .and_then(|value| value.to_str().ok())
+    {
+        if let (Ok(since), Ok(modified)) = (
+            DateTime::parse_from_rfc2822(value),
+            DateTime::parse_from_rfc3339(&meta.last_modified),
+        ) {
+            if modified <= since {
+                return Some(precondition_response(StatusCode::NOT_MODIFIED, meta, request_id));
+            }
+        }
+    }
+    None
+}
+
+fn precondition_response(
+    status: StatusCode,
+    meta: &crate::storage::ObjectMeta,
+    request_id: &str,
+) -> Response {
+    Response::builder()
+        .status(status)
+        .header(header::ETAG, &meta.etag)
+        .header(header::LAST_MODIFIED, http_date(&meta.last_modified))
+        .header("x-amz-request-id", request_id)
+        .body(Body::empty())
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
 fn partial_object_response(
     meta: &crate::storage::ObjectMeta,
     body: Body,
@@ -1105,6 +1255,25 @@ fn object_response_with_status(
         .header("Accept-Ranges", "bytes");
     if let Some(content_range) = content_range {
         builder = builder.header(header::CONTENT_RANGE, content_range);
+    }
+    if let Some(value) = &meta.content_encoding {
+        builder = builder.header(header::CONTENT_ENCODING, value);
+    }
+    for (name, value) in [
+        ("cache-control", meta.cache_control.as_deref()),
+        ("content-disposition", meta.content_disposition.as_deref()),
+        ("content-language", meta.content_language.as_deref()),
+        ("expires", meta.expires.as_deref()),
+    ] {
+        if let Some(value) = value {
+            builder = builder.header(name, value);
+        }
+    }
+    for (name, value) in &meta.user_meta {
+        builder = builder.header(format!("x-amz-meta-{name}"), value);
+    }
+    for (name, value) in &meta.checksums {
+        builder = builder.header(name, value);
     }
     builder
         .body(body)
@@ -1244,6 +1413,52 @@ fn extract_user_meta(headers: &HeaderMap) -> std::collections::HashMap<String, S
         }
     }
     m
+}
+
+fn put_object_opts(
+    headers: &HeaderMap,
+    owner: &crate::auth::StoredKey,
+    default_object_acl: CannedAcl,
+) -> PutObjectOpts {
+    let header_value = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned)
+    };
+    let content_encoding = header_value("content-encoding").and_then(|value| {
+        let remaining = value
+            .split(',')
+            .map(str::trim)
+            .filter(|encoding| !encoding.eq_ignore_ascii_case("aws-chunked"))
+            .filter(|encoding| !encoding.is_empty())
+            .collect::<Vec<_>>();
+        (!remaining.is_empty()).then(|| remaining.join(", "))
+    });
+    let checksums = headers
+        .iter()
+        .filter_map(|(name, value)| {
+            name.as_str()
+                .strip_prefix("x-amz-checksum-")
+                .and_then(|_| value.to_str().ok())
+                .map(|value| (name.as_str().to_string(), value.to_string()))
+        })
+        .collect();
+    PutObjectOpts {
+        content_type: header_value("content-type"),
+        canned_acl: header_value("x-amz-acl").as_deref().and_then(CannedAcl::parse),
+        acl: None,
+        owner: owner.canonical_id.clone(),
+        owner_display_name: owner.display_name.clone(),
+        default_object_acl,
+        user_meta: extract_user_meta(headers),
+        content_encoding,
+        cache_control: header_value("cache-control"),
+        content_disposition: header_value("content-disposition"),
+        content_language: header_value("content-language"),
+        expires: header_value("expires"),
+        checksums,
+    }
 }
 
 fn resolve_acl_from_request(
