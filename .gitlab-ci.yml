@@ -5,7 +5,7 @@
 # triggers this pipeline. Branch pushes (incl. master) do not build.
 #
 # Two Kaniko jobs build the engine and operator images in parallel and push
-# them to this project's GitLab Container Registry. Each image is tagged with
+# them to Docker Hub. Each image is tagged with
 # the release tag (e.g. v0.1.1) and with `latest`. The same tag is passed as
 # Docker build-arg VERSION so the Rust binaries report that version
 # (`--version` / startup logs).
@@ -28,25 +28,25 @@ workflow:
     name: gcr.io/kaniko-project/executor:v1.23.2-debug
     entrypoint: [""]
   variables:
-    # Cache repo lives next to the image and reuses layers across builds.
-    # Rust multi-stage builds benefit a lot from this.
-    KANIKO_CACHE: "$CI_REGISTRY_IMAGE/$IMAGE_NAME/cache"
+    # Docker Hub accepts namespace/repository references only. Keep the
+    # layer cache in its own repository rather than a nested `/cache` path.
+    DOCKERHUB_NAMESPACE: "garmingo"
+    KANIKO_CACHE: "$DOCKERHUB_NAMESPACE/flashs3-build-cache"
   before_script:
-    # GitLab injects $CI_REGISTRY_USER / $CI_REGISTRY_PASSWORD into every
-    # job for the project's own registry. We materialise the standard
-    # docker config so Kaniko picks it up.
+    # Set DOCKERHUB_USERNAME and masked/protected DOCKERHUB_TOKEN as GitLab
+    # CI/CD variables. Kaniko uses the standard Docker credential config.
     - mkdir -p /kaniko/.docker
     - |
       cat > /kaniko/.docker/config.json <<EOF
-      {"auths":{"$CI_REGISTRY":{"username":"$CI_REGISTRY_USER","password":"$CI_REGISTRY_PASSWORD"}}}
+      {"auths":{"https://index.docker.io/v1/":{"username":"$DOCKERHUB_USERNAME","password":"$DOCKERHUB_TOKEN"}}}
       EOF
   script:
     - >
       /kaniko/executor
       --context "$CI_PROJECT_DIR"
       --dockerfile "$CI_PROJECT_DIR/$DOCKERFILE_PATH"
-      --destination "$CI_REGISTRY_IMAGE/$IMAGE_NAME:$CI_COMMIT_TAG"
-      --destination "$CI_REGISTRY_IMAGE/$IMAGE_NAME:latest"
+      --destination "$DOCKERHUB_NAMESPACE/$IMAGE_NAME:$CI_COMMIT_TAG"
+      --destination "$DOCKERHUB_NAMESPACE/$IMAGE_NAME:latest"
       --cache=true
       --cache-repo "$KANIKO_CACHE"
       --single-snapshot
@@ -59,17 +59,17 @@ workflow:
 build:engine:
   extends: .build_template
   variables:
-    IMAGE_NAME: engine
+    IMAGE_NAME: flashs3
     DOCKERFILE_PATH: Dockerfile
 
 build:operator:
   extends: .build_template
   variables:
-    IMAGE_NAME: operator
+    IMAGE_NAME: flashs3-operator
     DOCKERFILE_PATH: Dockerfile.operator
 
 # Note: no separate `release:` job. Releases are created manually in the
 # GitLab UI (which is what creates the tag that triggers this pipeline).
 # Image pull refs after a successful pipeline:
-#   $CI_REGISTRY_IMAGE/engine:$CI_COMMIT_TAG
-#   $CI_REGISTRY_IMAGE/operator:$CI_COMMIT_TAG
+#   docker.io/garmingo/flashs3:$CI_COMMIT_TAG
+#   docker.io/garmingo/flashs3-operator:$CI_COMMIT_TAG

@@ -48,7 +48,7 @@ pub struct FlashS3BucketSpec {
 }
 
 fn default_image() -> String {
-    "registry.garmingo.net/garmingo/flashs3/engine:latest".into()
+    "docker.io/garmingo/flashs3:latest".into()
 }
 fn default_acl() -> String {
     "private".into()

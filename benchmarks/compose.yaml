@@ -5,10 +5,9 @@ name: flashs3-benchmark
 services:
   flashs3:
     # Use the release image so FlashS3 is benchmarked exactly as users deploy it.
-    image: ${FLASHS3_IMAGE:-registry.garmingo.net/garmingo/flashs3/engine:v0.1.1}
-    # FlashS3 v0.1.1 is currently published for amd64. Pin every backend to
-    # the same platform so an Apple Silicon host does not compare emulation
-    # against native arm64 images.
+    image: ${FLASHS3_IMAGE:-docker.io/garmingo/flashs3:v0.2.8}
+    # Pin every backend to the same platform so an Apple Silicon host does not
+    # compare emulation against native arm64 images.
     platform: linux/amd64
     environment:
       FLASHS3_ACCESS_KEY: ${BENCH_ACCESS_KEY}

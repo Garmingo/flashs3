@@ -39,7 +39,7 @@ spec:
                   type: string
                 image:
                   type: string
-                  default: registry.garmingo.net/garmingo/flashs3/engine:latest
+                  default: docker.io/garmingo/flashs3:latest
                 auth:
                   type: object
                   properties:

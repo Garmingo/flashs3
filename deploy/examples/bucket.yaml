@@ -6,7 +6,7 @@ metadata:
 spec:
   size: 50Gi
   # storageClassName: longhorn
-  image: registry.garmingo.net/garmingo/flashs3/engine:latest
+  image: docker.io/garmingo/flashs3:latest
   # Created automatically on engine startup.
   defaultBucketName: media-assets
   defaultObjectAcl: private

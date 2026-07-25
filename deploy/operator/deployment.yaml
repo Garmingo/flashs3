@@ -21,8 +21,8 @@ spec:
       automountServiceAccountToken: true
       containers:
         - name: operator
-          image: registry.garmingo.net/garmingo/flashs3/operator:latest
-          imagePullPolicy: IfNotPresent
+          image: docker.io/garmingo/flashs3-operator:latest
+          imagePullPolicy: Always
           env:
             - name: RUST_LOG
               value: info
@@ -58,6 +58,3 @@ spec:
                       fieldRef:
                         apiVersion: v1
                         fieldPath: metadata.namespace
-      # Uncomment if the registry requires auth:
-      # imagePullSecrets:
-      #   - name: garmingo-registry

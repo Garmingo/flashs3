@@ -6,9 +6,8 @@ The core application, `flash-s3-engine`, is fully standalone: S3 HTTP, an in-mem
 [`moka`](https://github.com/moka-rs/moka) cache, and direct disk I/O. The Kubernetes
 operator is optional.
 
-Built for small footprints: the `linux/amd64` engine image
-`registry.garmingo.net/garmingo/flashs3/engine:v0.1.1` is **35.4 MB** according
-to Docker's uncompressed image-size metadata — comfortably below 40 MB.
+Built for small footprints: release images are published for `linux/amd64` on
+Docker Hub.
 
 ## Quick start (local)
 
@@ -55,35 +54,36 @@ Ops endpoints: `/healthz`, `/readyz`, `/metrics`.
 
 ## Container images
 
-Release tags trigger GitLab CI (Kaniko), which publishes two images to the Garmingo registry:
+Release tags trigger GitLab CI (Kaniko), which publishes two public images to Docker Hub:
 
 | Image | Path |
 |-------|------|
-| Engine | `registry.garmingo.net/garmingo/flashs3/engine:<tag>` |
-| Operator | `registry.garmingo.net/garmingo/flashs3/operator:<tag>` |
+| Engine | `docker.io/garmingo/flashs3:<tag>` |
+| Operator | `docker.io/garmingo/flashs3-operator:<tag>` |
 
 Both images also receive the `latest` tag. Example using a fixed release:
 
 ```text
-registry.garmingo.net/garmingo/flashs3/engine:v0.1.1
-registry.garmingo.net/garmingo/flashs3/operator:v0.1.1
+docker.io/garmingo/flashs3:v0.2.8
+docker.io/garmingo/flashs3-operator:v0.2.8
 ```
 
-Release builds set the binary version from the Git tag (`VERSION` build argument → `CARGO_PKG_VERSION`). A `v0.1.1` tag makes `flash-s3-engine --version` report `0.1.1`.
+Release builds set the binary version from the Git tag (`VERSION` build argument → `CARGO_PKG_VERSION`). A `v0.2.8` tag makes `flash-s3-engine --version` report `0.2.8`.
 
 ### Run the engine standalone (without the operator)
 
 ```bash
-docker pull registry.garmingo.net/garmingo/flashs3/engine:latest
+docker pull docker.io/garmingo/flashs3:latest
 
 docker run --rm -p 9000:9000 \
   -e FLASHS3_ACCESS_KEY=flash \
   -e FLASHS3_SECRET_KEY=flashsecret \
   -v flashs3-data:/data \
-  registry.garmingo.net/garmingo/flashs3/engine:latest
+  docker.io/garmingo/flashs3:latest
 ```
 
-For a private registry, authenticate first (`docker login registry.garmingo.net`) or configure an `imagePullSecret` in your cluster.
+The release repositories are public, so neither `docker login` nor a Kubernetes
+`imagePullSecret` is required.
 
 ## Kubernetes Operator
 
@@ -100,13 +100,6 @@ kubectl apply -f deploy/crds/flashs3bucket.yaml
 ```bash
 kubectl apply -f deploy/operator/rbac.yaml
 
-# Optional: pull secret for registry.garmingo.net
-kubectl create secret docker-registry garmingo-registry \
-  --namespace flashs3-system \
-  --docker-server=registry.garmingo.net \
-  --docker-username=<user> \
-  --docker-password=<token>
-
 kubectl apply -f deploy/operator/deployment.yaml
 ```
 
@@ -114,7 +107,8 @@ The operator Deployment explicitly mounts the ServiceAccount token through a pro
 Without this mount, `kube::Client::try_default()` fails with
 `failed to read the default namespace`.
 
-If needed, enable `imagePullSecrets` in `deploy/operator/deployment.yaml` and pin the image to a release tag (for example, `…/operator:v0.1.1`).
+For production, pin the operator image to a release tag (for example,
+`docker.io/garmingo/flashs3-operator:v0.2.8`).
 
 ```bash
 kubectl -n flashs3-system rollout status deploy/flash-s3-operator
@@ -140,7 +134,7 @@ metadata:
 spec:
   size: 50Gi
   # storageClassName: longhorn
-  image: registry.garmingo.net/garmingo/flashs3/engine:latest
+  image: docker.io/garmingo/flashs3:latest
   # Created automatically when the engine starts.
   defaultBucketName: media-assets
   defaultObjectAcl: private
@@ -224,7 +218,7 @@ The benchmark environment is:
 | Workload matrix | 2,000 objects × 64 KiB, 128 KiB, and 1 MiB × 16, 32, and 1 concurrent clients |
 | Protocol | Path-style S3 over HTTP with AWS SigV4 |
 | FlashS3 cache | `InMemoryLRU`, 512 MiB maximum |
-| FlashS3 | `registry.garmingo.net/garmingo/flashs3/engine:v0.1.1` |
+| FlashS3 | `docker.io/garmingo/flashs3:v0.2.8` |
 | MinIO | `minio/minio:RELEASE.2025-04-22T22-12-26Z` |
 | Garage | `dxflrs/garage:v2.3.0` in single-node mode |
 
@@ -235,7 +229,7 @@ cp benchmarks/.env.example benchmarks/.env
 python3 scripts/benchmark_compare.py
 ```
 
-The runner pulls FlashS3 from the container registry; it does not build the
+The runner pulls FlashS3 from Docker Hub; it does not build the
 local Dockerfile. To compare another released FlashS3 version, update
 `FLASHS3_IMAGE` in `benchmarks/.env`.
 
