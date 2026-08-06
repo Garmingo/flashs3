@@ -1253,7 +1253,12 @@ fn md5_etag(data: &[u8]) -> String {
 
 fn io_err(e: std::io::Error) -> FlashError {
     if e.kind() == std::io::ErrorKind::InvalidData {
-        FlashError::InvalidRequest(e.to_string())
+        let msg = e.to_string();
+        if msg.contains("x-amz-content-sha256") {
+            FlashError::ContentSha256Mismatch
+        } else {
+            FlashError::InvalidRequest(msg)
+        }
     } else {
         FlashError::Internal(e.to_string())
     }

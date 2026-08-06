@@ -160,11 +160,16 @@ async fn dispatch_inner(
         .as_deref()
         .map(|p| p.split('/').filter(|segment| !segment.is_empty()).count() > 1)
         .unwrap_or(false);
+    // Stream PutObject / UploadPart. Presigned PutObject carries `X-Amz-*` query
+    // params, so "empty query" is not a valid PutObject signal — treat SigV4-only
+    // query maps as PutObject too. Otherwise large uploads hit the 16 MiB control
+    // buffer and fail with "buffered operation limit".
     let is_streaming_upload = method == Method::PUT
         && has_object_key
         && !headers.contains_key("x-amz-copy-source")
         && !query_map.contains_key("acl")
-        && (query_map.contains_key("partNumber") || query_map.is_empty());
+        && !query_map.contains_key("tagging")
+        && (query_map.contains_key("partNumber") || query_allows_streaming_put(&query_map));
     let aws_chunked = headers
         .get(header::CONTENT_ENCODING)
         .and_then(|value| value.to_str().ok())
@@ -420,6 +425,18 @@ async fn collect_control_body(body: Body) -> Result<Bytes, FlashError> {
         out.extend_from_slice(&chunk);
     }
     Ok(out.freeze())
+}
+
+/// True when the query map is compatible with streaming PutObject.
+///
+/// Allows empty maps, SigV4 query-auth (`X-Amz-*`), and the AWS SDK `x-id`
+/// hint. Any real S3 subresource (`acl`, `tagging`, …) forces the buffered path.
+fn query_allows_streaming_put(query: &BTreeMap<String, String>) -> bool {
+    query.keys().all(|k| {
+        k.starts_with("X-Amz-")
+            || k.starts_with("x-amz-")
+            || k.eq_ignore_ascii_case("x-id")
+    })
 }
 
 fn validate_buffered_integrity(headers: &HeaderMap, body: &[u8]) -> Result<(), FlashError> {
