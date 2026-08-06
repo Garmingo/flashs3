@@ -55,6 +55,40 @@ async fn presigned_put_unsigned_payload_uploads_and_is_readable() {
 }
 
 #[tokio::test]
+async fn presigned_put_larger_than_16mib_streams_not_buffered() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = app_state(&tmp);
+    ensure_bucket(&state, "presign").await;
+
+    // Regression: presigned PutObject used to hit collect_control_body's 16 MiB
+    // cap because X-Amz-* query params made the router treat it as non-streaming.
+    let path = "/presign/uploads/large.bin";
+    let body = Bytes::from(vec![0x5au8; 16 * 1024 * 1024 + 1]);
+    let qs = presigned_put_query(path, 900);
+    let (status, _, err_body) =
+        presigned_request(&state, Method::PUT, path, &qs, body.clone(), &[]).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&err_body)
+    );
+
+    let (status, _, got) = signed_request(
+        &state,
+        Method::GET,
+        path,
+        BTreeMap::new(),
+        Bytes::new(),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(got.len(), body.len());
+    assert_eq!(got, body);
+}
+
+#[tokio::test]
 async fn presigned_put_with_encoded_object_key() {
     let tmp = tempfile::tempdir().unwrap();
     let state = app_state(&tmp);

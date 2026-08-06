@@ -86,11 +86,11 @@ Release tags trigger GitLab CI (Kaniko), which publishes two public images to Do
 Both images also receive the `latest` tag. Example using a fixed release:
 
 ```text
-docker.io/garmingo/flashs3:v0.4.0
-docker.io/garmingo/flashs3-operator:v0.4.0
+docker.io/garmingo/flashs3:v0.4.1
+docker.io/garmingo/flashs3-operator:v0.4.1
 ```
 
-Release builds set the binary version from the Git tag (`VERSION` build argument → `CARGO_PKG_VERSION`). A `v0.4.0` tag makes `flash-s3-engine --version` report `0.4.0`.
+Release builds set the binary version from the Git tag (`VERSION` build argument → `CARGO_PKG_VERSION`). A `v0.4.1` tag makes `flash-s3-engine --version` report `0.4.1`.
 
 ### Run the engine standalone (without the operator)
 
@@ -142,7 +142,7 @@ Without this mount, `kube::Client::try_default()` fails with
 `failed to read the default namespace`.
 
 For production, pin the operator image to a release tag (for example,
-`docker.io/garmingo/flashs3-operator:v0.4.0`).
+`docker.io/garmingo/flashs3-operator:v0.4.1`).
 
 ```bash
 kubectl -n flashs3-system rollout status deploy/flash-s3-operator
@@ -280,7 +280,7 @@ The benchmark environment is:
 | Workload matrix | 2,000 objects × 64 KiB, 128 KiB, and 1 MiB × 16, 32, and 1 concurrent clients |
 | Protocol | Path-style S3 over HTTP with AWS SigV4 |
 | FlashS3 cache | `InMemoryLRU`, 512 MiB maximum |
-| FlashS3 | `docker.io/garmingo/flashs3:v0.4.0` |
+| FlashS3 | `docker.io/garmingo/flashs3:v0.4.1` |
 | MinIO | `minio/minio:RELEASE.2025-04-22T22-12-26Z` |
 | Garage | `dxflrs/garage:v2.3.0` in single-node mode |
 
