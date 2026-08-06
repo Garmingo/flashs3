@@ -44,6 +44,15 @@ pub const ENV_DEFAULT_BUCKET_CORS: &str = "FLASHS3_DEFAULT_BUCKET_CORS";
 pub const ENV_DEFAULT_BUCKET_CORS_ALLOW_ALL: &str = "FLASHS3_DEFAULT_BUCKET_CORS_ALLOW_ALL";
 /// When true, root API keys bypass ACL/policy checks (break-glass admin).
 pub const ENV_ROOT_BYPASSES_ACL: &str = "FLASHS3_ROOT_BYPASSES_ACL";
+/// Optional passphrase used to derive the SSE-S3 AES-256 key at rest.
+///
+/// When unset, a deterministic key is derived from `FLASHS3_CREDENTIALS_KEY` if
+/// set, otherwise from a fixed local-dev salt (not for production).
+pub const ENV_SSE_S3_KEY: &str = "FLASHS3_SSE_S3_KEY";
+/// DNS base for virtual-hosted-style requests (e.g. `s3.example.com`).
+///
+/// When set, `Host: {bucket}.{base}` routes to that bucket. Path-style still works.
+pub const ENV_VIRTUAL_HOST_BASE: &str = "FLASHS3_VIRTUAL_HOST_BASE";
 
 /// Default bind address for the engine HTTP server.
 pub const DEFAULT_BIND: &str = "0.0.0.0:9000";

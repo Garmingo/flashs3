@@ -68,9 +68,18 @@ pub enum FlashError {
     /// No CORS configuration attached to the bucket.
     #[error("NoSuchCORSConfiguration: The CORS configuration does not exist")]
     NoSuchCORSConfiguration,
+    /// Conditional request failed (If-Match / If-None-Match on Get/Put).
+    #[error("PreconditionFailed: At least one of the preconditions you specified did not hold")]
+    PreconditionFailed,
+    /// Object already exists when If-None-Match: * was specified.
+    #[error("ConditionalRequestConflict: The conditional request failed due to a conflicting operation")]
+    ConditionalRequestConflict,
     /// Generic client error with detail message.
     #[error("InvalidRequest: {0}")]
     InvalidRequest(String),
+    /// Invalid argument (e.g. non-numeric `max-keys`, incompatible query params).
+    #[error("InvalidArgument: {0}")]
+    InvalidArgument(String),
     /// Unexpected internal failure (I/O, corrupt meta, …).
     #[error("InternalError: {0}")]
     Internal(String),
@@ -103,7 +112,10 @@ impl FlashError {
             Self::NoSuchBucketPolicy => "NoSuchBucketPolicy",
             Self::MalformedCORSConfiguration => "MalformedXML",
             Self::NoSuchCORSConfiguration => "NoSuchCORSConfiguration",
+            Self::PreconditionFailed => "PreconditionFailed",
+            Self::ConditionalRequestConflict => "ConditionalRequestConflict",
             Self::InvalidRequest(_) => "InvalidRequest",
+            Self::InvalidArgument(_) => "InvalidArgument",
             Self::Internal(_) => "InternalError",
             Self::NotImplemented(_) => "NotImplemented",
         }
@@ -118,8 +130,10 @@ impl FlashError {
             | Self::NoSuchBucketPolicy
             | Self::NoSuchCORSConfiguration => 404,
             Self::AccessDenied | Self::InvalidAccessKeyId | Self::SignatureDoesNotMatch => 403,
-            Self::BucketAlreadyOwnedByYou => 409,
-            Self::BucketNotEmpty => 409,
+            Self::BucketAlreadyOwnedByYou | Self::BucketNotEmpty | Self::ConditionalRequestConflict => {
+                409
+            }
+            Self::PreconditionFailed => 412,
             Self::NotImplemented(_) => 501,
             Self::Internal(_) => 500,
             _ => 400,

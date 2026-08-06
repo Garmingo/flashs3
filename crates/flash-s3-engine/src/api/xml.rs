@@ -29,40 +29,373 @@ pub fn list_buckets_xml(buckets: &[BucketInfo], owner_id: &str, owner_name: &str
     body
 }
 
-/// `ListBucketResult` body (ListObjectsV2-shaped).
+/// `ListBucketResult` body (ListObjectsV2).
 pub fn list_objects_v2_xml(
     bucket: &str,
     prefix: &str,
+    delimiter: Option<&str>,
     max_keys: usize,
     truncated: bool,
     contents: &[IndexEntry],
+    common_prefixes: &[String],
     next_token: Option<&str>,
+    start_after: Option<&str>,
+    continuation_token: Option<&str>,
+    encoding_type: Option<&str>,
+    owner: Option<(&str, &str)>,
 ) -> String {
+    let encode = encoding_type.map(|t| t.eq_ignore_ascii_case("url")).unwrap_or(false);
+    let enc = |s: &str| if encode { s3_url_encode(s) } else { s.to_string() };
+    let key_count = contents.len() + common_prefixes.len();
     let mut body = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?><ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>{}</Name><Prefix>{}</Prefix><MaxKeys>{}</MaxKeys><IsTruncated>{}</IsTruncated><KeyCount>{}</KeyCount>"#,
         xml_escape(bucket),
-        xml_escape(prefix),
+        xml_escape(&enc(prefix)),
         max_keys,
         truncated,
-        contents.len()
+        key_count
     );
+    if let Some(d) = delimiter.filter(|d| !d.is_empty()) {
+        body.push_str(&format!("<Delimiter>{}</Delimiter>", xml_escape(&enc(d))));
+    }
+    if encode {
+        body.push_str("<EncodingType>url</EncodingType>");
+    }
+    if let Some(t) = continuation_token {
+        body.push_str(&format!(
+            "<ContinuationToken>{}</ContinuationToken>",
+            xml_escape(t)
+        ));
+    }
     if let Some(t) = next_token {
         body.push_str(&format!(
             "<NextContinuationToken>{}</NextContinuationToken>",
             xml_escape(t)
         ));
     }
+    if let Some(s) = start_after {
+        body.push_str(&format!("<StartAfter>{}</StartAfter>", xml_escape(s)));
+    }
+    append_contents_and_prefixes(&mut body, contents, common_prefixes, encode, owner);
+    body.push_str("</ListBucketResult>");
+    body
+}
+
+/// `ListBucketResult` body (ListObjects V1).
+pub fn list_objects_v1_xml(
+    bucket: &str,
+    prefix: &str,
+    delimiter: Option<&str>,
+    marker: Option<&str>,
+    max_keys: usize,
+    truncated: bool,
+    contents: &[IndexEntry],
+    common_prefixes: &[String],
+    next_marker: Option<&str>,
+    encoding_type: Option<&str>,
+    owner: Option<(&str, &str)>,
+) -> String {
+    let encode = encoding_type.map(|t| t.eq_ignore_ascii_case("url")).unwrap_or(false);
+    let enc = |s: &str| if encode { s3_url_encode(s) } else { s.to_string() };
+    let mut body = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?><ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>{}</Name><Prefix>{}</Prefix><Marker>{}</Marker><MaxKeys>{}</MaxKeys><IsTruncated>{}</IsTruncated>"#,
+        xml_escape(bucket),
+        xml_escape(&enc(prefix)),
+        xml_escape(marker.unwrap_or("")),
+        max_keys,
+        truncated
+    );
+    if let Some(d) = delimiter.filter(|d| !d.is_empty()) {
+        body.push_str(&format!("<Delimiter>{}</Delimiter>", xml_escape(&enc(d))));
+    }
+    if encode {
+        body.push_str("<EncodingType>url</EncodingType>");
+    }
+    if truncated {
+        if let Some(m) = next_marker {
+            body.push_str(&format!("<NextMarker>{}</NextMarker>", xml_escape(m)));
+        }
+    }
+    append_contents_and_prefixes(&mut body, contents, common_prefixes, encode, owner);
+    body.push_str("</ListBucketResult>");
+    body
+}
+
+/// `ListVersionsResult` for non-versioned buckets (each object as `VersionId=null`).
+///
+/// Enough for S3 clients / Ceph s3-tests cleanup (`nuke_bucket` uses ListObjectVersions
+/// before DeleteBucket). Full versioning is not implemented.
+pub fn list_object_versions_xml(
+    bucket: &str,
+    prefix: &str,
+    delimiter: Option<&str>,
+    key_marker: Option<&str>,
+    version_id_marker: Option<&str>,
+    max_keys: usize,
+    truncated: bool,
+    contents: &[IndexEntry],
+    common_prefixes: &[String],
+    next_key_marker: Option<&str>,
+    owner_id: &str,
+    owner_name: &str,
+) -> String {
+    let mut body = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?><ListVersionsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>{}</Name><Prefix>{}</Prefix><KeyMarker>{}</KeyMarker><VersionIdMarker>{}</VersionIdMarker><MaxKeys>{}</MaxKeys><IsTruncated>{}</IsTruncated>"#,
+        xml_escape(bucket),
+        xml_escape(prefix),
+        xml_escape(key_marker.unwrap_or("")),
+        xml_escape(version_id_marker.unwrap_or("")),
+        max_keys,
+        truncated
+    );
+    if let Some(d) = delimiter {
+        body.push_str(&format!("<Delimiter>{}</Delimiter>", xml_escape(d)));
+    }
+    if truncated {
+        if let Some(k) = next_key_marker {
+            body.push_str(&format!(
+                "<NextKeyMarker>{}</NextKeyMarker><NextVersionIdMarker>null</NextVersionIdMarker>",
+                xml_escape(k)
+            ));
+        }
+    }
     for c in contents {
         body.push_str(&format!(
-            "<Contents><Key>{}</Key><LastModified>{}</LastModified><ETag>{}</ETag><Size>{}</Size><StorageClass>STANDARD</StorageClass></Contents>",
+            "<Version><Key>{}</Key><VersionId>null</VersionId><IsLatest>true</IsLatest><LastModified>{}</LastModified><ETag>{}</ETag><Size>{}</Size><StorageClass>STANDARD</StorageClass><Owner><ID>{}</ID><DisplayName>{}</DisplayName></Owner></Version>",
             xml_escape(&c.key),
+            xml_escape(&c.last_modified),
+            xml_escape(&c.etag),
+            c.size,
+            xml_escape(owner_id),
+            xml_escape(owner_name)
+        ));
+    }
+    for p in common_prefixes {
+        body.push_str(&format!(
+            "<CommonPrefixes><Prefix>{}</Prefix></CommonPrefixes>",
+            xml_escape(p)
+        ));
+    }
+    body.push_str("</ListVersionsResult>");
+    body
+}
+
+/// URL-encode for `encoding-type=url` (keep `/` unencoded, like AWS S3).
+pub fn s3_url_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                out.push(b as char);
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+fn append_contents_and_prefixes(
+    body: &mut String,
+    contents: &[IndexEntry],
+    common_prefixes: &[String],
+    encode: bool,
+    owner: Option<(&str, &str)>,
+) {
+    let enc = |s: &str| if encode { s3_url_encode(s) } else { s.to_string() };
+    for c in contents {
+        body.push_str(&format!(
+            "<Contents><Key>{}</Key><LastModified>{}</LastModified><ETag>{}</ETag><Size>{}</Size><StorageClass>STANDARD</StorageClass>",
+            xml_escape(&enc(&c.key)),
             xml_escape(&c.last_modified),
             xml_escape(&c.etag),
             c.size
         ));
+        if let Some((oid, oname)) = owner {
+            body.push_str(&format!(
+                "<Owner><ID>{}</ID><DisplayName>{}</DisplayName></Owner>",
+                xml_escape(oid),
+                xml_escape(oname)
+            ));
+        }
+        body.push_str("</Contents>");
     }
-    body.push_str("</ListBucketResult>");
+    for p in common_prefixes {
+        body.push_str(&format!(
+            "<CommonPrefixes><Prefix>{}</Prefix></CommonPrefixes>",
+            xml_escape(&enc(p))
+        ));
+    }
+}
+
+/// Empty `LocationConstraint` XML (`us-east-1`) or region string.
+pub fn bucket_location_xml(region: &str) -> String {
+    if region == "us-east-1" {
+        r#"<?xml version="1.0" encoding="UTF-8"?><LocationConstraint xmlns="http://s3.amazonaws.com/doc/2006-03-01/"></LocationConstraint>"#.into()
+    } else {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?><LocationConstraint xmlns="http://s3.amazonaws.com/doc/2006-03-01/">{}</LocationConstraint>"#,
+            xml_escape(region)
+        )
+    }
+}
+
+/// Tagging configuration XML.
+pub fn tagging_xml(tags: &[(String, String)]) -> String {
+    let mut body = String::from(
+        r#"<?xml version="1.0" encoding="UTF-8"?><Tagging xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><TagSet>"#,
+    );
+    for (k, v) in tags {
+        body.push_str(&format!(
+            "<Tag><Key>{}</Key><Value>{}</Value></Tag>",
+            xml_escape(k),
+            xml_escape(v)
+        ));
+    }
+    body.push_str("</TagSet></Tagging>");
     body
+}
+
+/// Parse `<Tagging><TagSet><Tag><Key/><Value/></Tag>…` XML.
+pub fn parse_tagging_xml(raw: &str) -> Result<Vec<(String, String)>, flash_s3_common::FlashError> {
+    let mut tags = Vec::new();
+    let mut rest = raw;
+    while let Some(block) = extract_block(rest, "Tag") {
+        let key = extract_tag(&block, "Key").unwrap_or_default();
+        let value = extract_tag(&block, "Value").unwrap_or_default();
+        if key.is_empty() {
+            return Err(flash_s3_common::FlashError::InvalidRequest(
+                "tag key required".into(),
+            ));
+        }
+        tags.push((key, value));
+        if let Some(idx) = rest.find("</Tag>") {
+            rest = &rest[idx + "</Tag>".len()..];
+        } else {
+            break;
+        }
+    }
+    if tags.len() > 50 {
+        return Err(flash_s3_common::FlashError::InvalidRequest(
+            "too many tags".into(),
+        ));
+    }
+    Ok(tags)
+}
+
+/// Parse multi-object delete request.
+pub fn parse_delete_objects_xml(
+    raw: &str,
+) -> Result<(bool, Vec<String>), flash_s3_common::FlashError> {
+    let quiet = extract_tag(raw, "Quiet")
+        .map(|v| v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let mut keys = Vec::new();
+    let mut rest = raw;
+    while let Some(block) = extract_block(rest, "Object") {
+        let key = extract_tag(&block, "Key").unwrap_or_default();
+        if key.is_empty() {
+            return Err(flash_s3_common::FlashError::InvalidRequest(
+                "Delete Object Key required".into(),
+            ));
+        }
+        keys.push(key);
+        if let Some(idx) = rest.find("</Object>") {
+            rest = &rest[idx + "</Object>".len()..];
+        } else {
+            break;
+        }
+    }
+    Ok((quiet, keys))
+}
+
+/// Multi-object delete result XML.
+pub fn delete_objects_result_xml(
+    deleted: &[String],
+    errors: &[(String, &str, &str)],
+) -> String {
+    let mut body = String::from(
+        r#"<?xml version="1.0" encoding="UTF-8"?><DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">"#,
+    );
+    for key in deleted {
+        body.push_str(&format!("<Deleted><Key>{}</Key></Deleted>", xml_escape(key)));
+    }
+    for (key, code, message) in errors {
+        body.push_str(&format!(
+            "<Error><Key>{}</Key><Code>{}</Code><Message>{}</Message></Error>",
+            xml_escape(key),
+            xml_escape(code),
+            xml_escape(message)
+        ));
+    }
+    body.push_str("</DeleteResult>");
+    body
+}
+
+/// `ListMultipartUploadsResult` XML.
+pub fn list_multipart_uploads_xml(
+    bucket: &str,
+    prefix: &str,
+    delimiter: Option<&str>,
+    key_marker: Option<&str>,
+    upload_id_marker: Option<&str>,
+    max_uploads: usize,
+    truncated: bool,
+    uploads: &[(String, String, String)],
+    common_prefixes: &[String],
+    next_key_marker: Option<&str>,
+    next_upload_id_marker: Option<&str>,
+) -> String {
+    let mut body = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?><ListMultipartUploadsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Bucket>{}</Bucket><Prefix>{}</Prefix><KeyMarker>{}</KeyMarker><UploadIdMarker>{}</UploadIdMarker><MaxUploads>{}</MaxUploads><IsTruncated>{}</IsTruncated>"#,
+        xml_escape(bucket),
+        xml_escape(prefix),
+        xml_escape(key_marker.unwrap_or("")),
+        xml_escape(upload_id_marker.unwrap_or("")),
+        max_uploads,
+        truncated
+    );
+    if let Some(d) = delimiter {
+        body.push_str(&format!("<Delimiter>{}</Delimiter>", xml_escape(d)));
+    }
+    if truncated {
+        if let Some(k) = next_key_marker {
+            body.push_str(&format!(
+                "<NextKeyMarker>{}</NextKeyMarker>",
+                xml_escape(k)
+            ));
+        }
+        if let Some(u) = next_upload_id_marker {
+            body.push_str(&format!(
+                "<NextUploadIdMarker>{}</NextUploadIdMarker>",
+                xml_escape(u)
+            ));
+        }
+    }
+    for (key, upload_id, initiated) in uploads {
+        body.push_str(&format!(
+            "<Upload><Key>{}</Key><UploadId>{}</UploadId><Initiated>{}</Initiated><StorageClass>STANDARD</StorageClass></Upload>",
+            xml_escape(key),
+            xml_escape(upload_id),
+            xml_escape(initiated)
+        ));
+    }
+    for p in common_prefixes {
+        body.push_str(&format!(
+            "<CommonPrefixes><Prefix>{}</Prefix></CommonPrefixes>",
+            xml_escape(p)
+        ));
+    }
+    body.push_str("</ListMultipartUploadsResult>");
+    body
+}
+
+/// `CopyPartResult` XML for UploadPartCopy.
+pub fn copy_part_result_xml(etag: &str, last_modified: &str) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?><CopyPartResult><LastModified>{}</LastModified><ETag>{}</ETag></CopyPartResult>"#,
+        xml_escape(last_modified),
+        xml_escape(etag)
+    )
 }
 
 /// `AccessControlPolicy` XML for GetBucketAcl / GetObjectAcl.

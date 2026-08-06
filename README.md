@@ -60,12 +60,16 @@ Ops endpoints: `/healthz`, `/readyz`, `/metrics`.
 
 ## Features
 
-- Path-style S3 API: Buckets, Objects, Multipart, CopyObject
+- Path-style and virtual-hosted-style S3 API
+- Buckets, Objects, Multipart (incl. ListMultipartUploads / UploadPartCopy), CopyObject
+- DeleteObjects, Object/Bucket Tagging, GetBucketLocation
+- ListObjects V1/V2 with delimiter / CommonPrefixes
 - SigV4 + Presigned URLs
 - Multiple API keys (`credentials.json` in the data directory)
 - Rich S3 ACLs (bucket and object ACLs, canned ACLs, and grants)
-- Bucket policies (allow/deny, key principals, prefixes, and actions)
+- Bucket policies (allow/deny, principals, prefixes, actions, common Condition operators)
 - Bucket CORS (`PutBucketCors` / `GetBucketCors` / `DeleteBucketCors`, browser `OPTIONS` preflight, `Access-Control-*` on GET/PUT/HEAD)
+- SSE-S3 (`AES256`), flexible checksums (CRC32/CRC32C/SHA1/SHA256), conditional PutObject
 - Hybrid cache: small objects are written through to disk and cached in moka's byte-LRU; large objects stream directly to disk
 - Four-hex filesystem sharding (`aa/bb/<hash>/current/`)
 - Prometheus metrics, graceful shutdown, and panic isolation
@@ -206,6 +210,8 @@ Credentials: if `spec.auth.secretRef` is omitted, the operator creates a Secret 
 | `FLASHS3_DEFAULT_BUCKET_NAME` | Optional bucket created idempotently on startup |
 | `FLASHS3_DEFAULT_BUCKET_CORS` | Optional camelCase JSON CORS (`{"rules":[…]}` or `{"allowAll":true}`) for the default bucket |
 | `FLASHS3_DEFAULT_BUCKET_CORS_ALLOW_ALL` | `false` — when `true`, apply permissive `*` CORS to the default bucket (local/dev; overrides `FLASHS3_DEFAULT_BUCKET_CORS`) |
+| `FLASHS3_SSE_S3_KEY` | Optional passphrase to derive the SSE-S3 AES-256 key |
+| `FLASHS3_VIRTUAL_HOST_BASE` | Optional DNS base for virtual-hosted-style (`{bucket}.{base}`) |
 
 When `FLASHS3_CREDENTIALS_KEY` is set, each `secret_key` in `credentials.json` is stored as
 `enc:v1:…`. The same key is required on every start; losing it makes encrypted secrets unrecoverable.
@@ -217,8 +223,22 @@ cargo test
 ```
 
 Coverage includes ACL/policy/CORS/identity unit tests plus engine integration tests
-(storage, HTTP/SigV4, CORS preflight, cache, multipart, copy).
+(storage, HTTP/SigV4, CORS preflight, cache, multipart, copy, presigned uploads, S3 parity).
 
+### Ceph s3-tests coverage benchmark (optional)
+
+Not part of `cargo test` and not a CI gate. Runs [ceph/s3-tests](https://github.com/ceph/s3-tests)
+against a temporary local engine to see remaining API gaps:
+
+```bash
+./scripts/test-spec-coverage.sh
+# optional narrower filter:
+S3_TESTS_FILTER='s3tests/functional/test_s3.py' ./scripts/test-spec-coverage.sh
+```
+
+Requires `cargo`, `python3` (+`venv`), `curl`, and network access on first run
+(clones into `.cache/s3-tests`, creates `.cache/s3-tests-venv`). The script always
+exits 0; inspect `.cache/s3tests-last.out` for the summary.
 ## Benchmarks
 
 ### FlashS3-only benchmarks

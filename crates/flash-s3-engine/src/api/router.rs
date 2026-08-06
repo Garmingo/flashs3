@@ -17,7 +17,7 @@ use bytes::{Bytes, BytesMut};
 use chrono::DateTime;
 use flash_s3_common::{
     allowed_request_headers, AccessControlPolicy, CannedAcl, CorsConfiguration, CorsRule,
-    FlashError, ObjectKey, Permission,
+    FlashError, ObjectKey, Permission, PolicyConditionCtx,
 };
 use futures::{StreamExt, TryStreamExt};
 use md5::Digest as Md5Digest;
@@ -32,7 +32,7 @@ use crate::api::aws_chunked::{AwsChunkedConfig, AwsChunkedReader, PayloadHashRea
 use crate::api::xml;
 use crate::auth::{hash_payload, verify_request, AuthContext, S3Action};
 use crate::server::AppState;
-use crate::storage::PutObjectOpts;
+use crate::storage::{PutObjectOpts, verify_checksums, request_wants_sse_s3, sse_encrypt};
 
 /// Build the Axum router with health/metrics and the S3 catch-all.
 ///
@@ -192,16 +192,9 @@ async fn dispatch_inner(
             &headers,
             payload_hash,
         )?;
-        let path = path.ok_or_else(|| FlashError::InvalidRequest("missing path".into()))?;
-        let mut segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-        if segments.is_empty() {
-            return Err(FlashError::InvalidRequest("empty path".into()));
-        }
-        let bucket = segments.remove(0).to_string();
-        let key_raw = segments.join("/");
-        if key_raw.is_empty() {
-            return Err(FlashError::InvalidRequest("missing object key".into()));
-        }
+        let (bucket_opt, key_opt) = resolve_bucket_key(&state, &headers, path.as_deref());
+        let bucket = bucket_opt.ok_or_else(|| FlashError::InvalidRequest("missing bucket".into()))?;
+        let key_raw = key_opt.ok_or_else(|| FlashError::InvalidRequest("missing object key".into()))?;
         let key = ObjectKey::new(&key_raw).map_err(|_| FlashError::InvalidObjectName)?;
         let stream = TryStreamExt::map_err(body.into_data_stream(), std::io::Error::other);
         let raw_reader = StreamReader::new(stream);
@@ -290,22 +283,14 @@ async fn dispatch_inner(
         }
     }
 
-    // Require auth for mutating service ops when keys exist
-    if path.is_none() && method == Method::GET {
+    // Virtual-hosted-style bucket extraction
+    let (bucket, key_raw) = resolve_bucket_key(&state, &headers, path.as_deref());
+
+    if bucket.is_none() && method == Method::GET {
         return list_buckets(&state, &ctx, request_id).await;
     }
 
-    let path = path.ok_or_else(|| FlashError::InvalidRequest("missing path".into()))?;
-    let mut segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-    if segments.is_empty() {
-        return Err(FlashError::InvalidRequest("empty path".into()));
-    }
-    let bucket = segments.remove(0).to_string();
-    let key_raw = if segments.is_empty() {
-        None
-    } else {
-        Some(segments.join("/"))
-    };
+    let bucket = bucket.ok_or_else(|| FlashError::InvalidRequest("missing bucket".into()))?;
 
     // Bucket-level
     if key_raw.is_none() {
@@ -327,6 +312,92 @@ async fn dispatch_inner(
         request_id,
     )
     .await
+}
+
+/// Resolve bucket and key from either virtual-hosted-style or path-style.
+fn resolve_bucket_key(
+    state: &AppState,
+    headers: &HeaderMap,
+    path: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    if let Some(base) = state.config.virtual_host_base.as_deref() {
+        if let Some(host_val) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) {
+            let host = host_val.split(':').next().unwrap_or(host_val);
+            if let Some(bucket) = host.strip_suffix(&format!(".{}", base)) {
+                if !bucket.is_empty() {
+                    let key_raw = path.and_then(object_key_from_path_tail);
+                    return (Some(bucket.to_string()), key_raw);
+                }
+            }
+        }
+    }
+    // Path-style fallback
+    match path {
+        Some(p) => {
+            let mut segments: Vec<&str> = p.split('/').filter(|s| !s.is_empty()).collect();
+            if segments.is_empty() {
+                (None, None)
+            } else {
+                let bucket = segments.remove(0).to_string();
+                let key = if segments.is_empty() {
+                    None
+                } else {
+                    // Preserve trailing slash (`foo/` is a distinct S3 object key).
+                    let mut key = segments.join("/");
+                    if p.ends_with('/') {
+                        key.push('/');
+                    }
+                    Some(key)
+                };
+                (Some(bucket), key)
+            }
+        }
+        None => (None, None),
+    }
+}
+
+/// Object key from a virtual-hosted path tail (no bucket segment).
+fn object_key_from_path_tail(p: &str) -> Option<String> {
+    let segments: Vec<&str> = p.split('/').filter(|s| !s.is_empty()).collect();
+    if segments.is_empty() {
+        return None;
+    }
+    let mut key = segments.join("/");
+    if p.ends_with('/') {
+        key.push('/');
+    }
+    Some(key)
+}
+
+/// Check If-None-Match / If-Match preconditions for PutObject.
+async fn check_put_preconditions(
+    state: &AppState,
+    bucket: &str,
+    key: &ObjectKey,
+    headers: &HeaderMap,
+) -> Result<(), FlashError> {
+    if let Some(val) = headers.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok()) {
+        if val.trim() == "*" {
+            if state.store.get_object_meta(bucket, key).await.is_ok() {
+                return Err(FlashError::PreconditionFailed);
+            }
+        }
+    }
+    if let Some(val) = headers.get(header::IF_MATCH).and_then(|v| v.to_str().ok()) {
+        match state.store.get_object_meta(bucket, key).await {
+            Ok(meta) => {
+                let matches = val.split(',').map(str::trim).any(|t| t == "*" || t == meta.etag);
+                if !matches {
+                    return Err(FlashError::PreconditionFailed);
+                }
+            }
+            Err(FlashError::NoSuchKey) => {
+                return Err(FlashError::PreconditionFailed);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 /// Collect only control-plane and fully signed non-streaming payloads. Object
@@ -454,6 +525,175 @@ async fn bucket_ops(
     if query.contains_key("acl") {
         return bucket_acl_ops(state, ctx, method, bucket, body, headers, request_id).await;
     }
+    // GetBucketLocation
+    if query.contains_key("location") && *method == Method::GET {
+        let info = state.store.get_bucket(bucket).await?;
+        let policy = state.store.load_policy(bucket).await?;
+        state.authorizer.authorize(ctx, S3Action::GetBucketLocation, Some(&info), None, policy.as_ref())?;
+        let body = xml::bucket_location_xml(&state.config.region);
+        state.metrics.s3_requests.with_label_values(&["GET", "200", "GetBucketLocation"]).inc();
+        return Ok(xml_ok(body, request_id));
+    }
+    // Bucket tagging
+    if query.contains_key("tagging") {
+        let info = state.store.get_bucket(bucket).await?;
+        let policy = state.store.load_policy(bucket).await?;
+        match *method {
+            Method::GET => {
+                state.authorizer.authorize(ctx, S3Action::GetBucketTagging, Some(&info), None, policy.as_ref())?;
+                let tags = state.store.get_bucket_tags(bucket).await?;
+                state.metrics.s3_requests.with_label_values(&["GET", "200", "GetBucketTagging"]).inc();
+                return Ok(xml_ok(xml::tagging_xml(&tags), request_id));
+            }
+            Method::PUT => {
+                state.authorizer.authorize(ctx, S3Action::PutBucketTagging, Some(&info), None, policy.as_ref())?;
+                let raw = std::str::from_utf8(body)
+                    .map_err(|_| FlashError::InvalidRequest("invalid tagging xml".into()))?;
+                let tags = xml::parse_tagging_xml(raw)?;
+                state.store.put_bucket_tags(bucket, &tags).await?;
+                state.metrics.s3_requests.with_label_values(&["PUT", "200", "PutBucketTagging"]).inc();
+                return Ok(StatusCode::OK.into_response());
+            }
+            Method::DELETE => {
+                state.authorizer.authorize(ctx, S3Action::DeleteBucketTagging, Some(&info), None, policy.as_ref())?;
+                state.store.delete_bucket_tags(bucket).await?;
+                state.metrics.s3_requests.with_label_values(&["DELETE", "204", "DeleteBucketTagging"]).inc();
+                return Ok(StatusCode::NO_CONTENT.into_response());
+            }
+            _ => return Err(FlashError::InvalidRequest("bad tagging method".into())),
+        }
+    }
+    // DeleteObjects (multi-object delete)
+    if query.contains_key("delete") && *method == Method::POST {
+        let info = state.store.get_bucket(bucket).await?;
+        let policy = state.store.load_policy(bucket).await?;
+        let raw = std::str::from_utf8(body)
+            .map_err(|_| FlashError::InvalidRequest("invalid delete xml".into()))?;
+        let (quiet, keys) = xml::parse_delete_objects_xml(raw)?;
+        let mut deleted = Vec::new();
+        let mut errors: Vec<(String, &str, &str)> = Vec::new();
+        for key_str in &keys {
+            match ObjectKey::new(key_str) {
+                Ok(key) => {
+                    let auth_result = state.authorizer.authorize(
+                        ctx,
+                        S3Action::DeleteObject,
+                        Some(&info),
+                        None,
+                        policy.as_ref(),
+                    );
+                    if let Err(_) = auth_result {
+                        errors.push((key_str.clone(), "AccessDenied", "Access Denied"));
+                        continue;
+                    }
+                    match state.store.delete_object(bucket, &key).await {
+                        Ok(()) => {
+                            state.cache.invalidate(bucket, key.as_str()).await;
+                            deleted.push(key_str.clone());
+                        }
+                        Err(FlashError::NoSuchKey) => {
+                            deleted.push(key_str.clone());
+                        }
+                        Err(_) => {
+                            errors.push((key_str.clone(), "InternalError", "Internal Error"));
+                        }
+                    }
+                }
+                Err(_) => {
+                    errors.push((key_str.clone(), "InvalidArgument", "Invalid key"));
+                }
+            }
+        }
+        let resp_body = if quiet && errors.is_empty() {
+            xml::delete_objects_result_xml(&[], &errors)
+        } else {
+            xml::delete_objects_result_xml(&deleted, &errors)
+        };
+        state.metrics.s3_requests.with_label_values(&["POST", "200", "DeleteObjects"]).inc();
+        return Ok(xml_ok(resp_body, request_id));
+    }
+    // ListMultipartUploads
+    if query.contains_key("uploads") && *method == Method::GET {
+        let info = state.store.get_bucket(bucket).await?;
+        let policy = state.store.load_policy(bucket).await?;
+        state.authorizer.authorize(ctx, S3Action::ListBucketMultipartUploads, Some(&info), None, policy.as_ref())?;
+        let prefix = query.get("prefix").map(|s| s.as_str()).unwrap_or("");
+        let delimiter = query.get("delimiter").map(|s| s.as_str());
+        let key_marker = query.get("key-marker").map(|s| s.as_str());
+        let upload_id_marker = query.get("upload-id-marker").map(|s| s.as_str());
+        let max_uploads: usize = query.get("max-uploads").and_then(|s| s.parse().ok()).unwrap_or(1000).min(1000);
+        let (uploads, common_prefixes, truncated, next_key, next_upload) = state
+            .store
+            .list_multipart_uploads(bucket, prefix, key_marker, upload_id_marker, delimiter, max_uploads)
+            .await?;
+        let body = xml::list_multipart_uploads_xml(
+            bucket,
+            prefix,
+            delimiter,
+            key_marker,
+            upload_id_marker,
+            max_uploads,
+            truncated,
+            &uploads,
+            &common_prefixes,
+            next_key.as_deref(),
+            next_upload.as_deref(),
+        );
+        state.metrics.s3_requests.with_label_values(&["GET", "200", "ListMultipartUploads"]).inc();
+        return Ok(xml_ok(body, request_id));
+    }
+    // ListObjectVersions (non-versioned: current objects with VersionId=null).
+    // Required so clients/s3-tests can empty buckets before DeleteBucket.
+    if query.contains_key("versions") && *method == Method::GET {
+        let info = state.store.get_bucket(bucket).await?;
+        let policy = state.store.load_policy(bucket).await?;
+        let prefix = query.get("prefix").cloned().unwrap_or_default();
+        let delimiter = query.get("delimiter").map(|s| s.as_str());
+        let max_keys: usize = query
+            .get("max-keys")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1000)
+            .min(1000);
+        let key_marker = query.get("key-marker").map(|s| s.as_str());
+        let version_id_marker = query.get("version-id-marker").map(|s| s.as_str());
+        let condition_ctx = PolicyConditionCtx {
+            access_key: ctx.access_key(),
+            s3_prefix: Some(&prefix),
+            s3_delimiter: delimiter,
+            s3_x_amz_acl: None,
+        };
+        state.authorizer.authorize_with_ctx(
+            ctx,
+            S3Action::ListBucket,
+            Some(&info),
+            None,
+            policy.as_ref(),
+            Some(&condition_ctx),
+        )?;
+        let result = state
+            .store
+            .list_objects(bucket, &prefix, key_marker, delimiter, max_keys)?;
+        let body = xml::list_object_versions_xml(
+            bucket,
+            &prefix,
+            delimiter,
+            key_marker,
+            version_id_marker,
+            max_keys,
+            result.truncated,
+            &result.contents,
+            &result.common_prefixes,
+            result.next_token.as_deref(),
+            info.owner.as_str(),
+            &info.owner_display_name,
+        );
+        state
+            .metrics
+            .s3_requests
+            .with_label_values(&["GET", "200", "ListObjectVersions"])
+            .inc();
+        return Ok(xml_ok(body, request_id));
+    }
 
     match *method {
         Method::PUT => {
@@ -501,44 +741,94 @@ async fn bucket_ops(
             state.metrics.s3_requests.with_label_values(&["DELETE", "204", "DeleteBucket"]).inc();
             Ok(StatusCode::NO_CONTENT.into_response())
         }
-        Method::GET => {
+        Method::GET | Method::POST => {
             let info = state.store.get_bucket(bucket).await?;
             let policy = state.store.load_policy(bucket).await?;
-            state.authorizer.authorize(
+            let prefix = query.get("prefix").cloned().unwrap_or_default();
+            let delimiter = query.get("delimiter").map(|s| s.as_str());
+            let encoding_type = query.get("encoding-type").map(|s| s.as_str());
+            let max_keys = parse_list_max_keys(query.get("max-keys").map(|s| s.as_str()))?;
+            let is_v2 = query.get("list-type").map(|s| s == "2").unwrap_or(false);
+            if query.contains_key("allow-unordered")
+                && delimiter.map(|d| !d.is_empty()).unwrap_or(false)
+            {
+                return Err(FlashError::InvalidArgument(
+                    "Unordered listing not supported with delimiter".into(),
+                ));
+            }
+            let condition_ctx = PolicyConditionCtx {
+                access_key: ctx.access_key(),
+                s3_prefix: Some(&prefix),
+                s3_delimiter: delimiter,
+                s3_x_amz_acl: None,
+            };
+            state.authorizer.authorize_with_ctx(
                 ctx,
                 S3Action::ListBucket,
                 Some(&info),
                 None,
                 policy.as_ref(),
+                Some(&condition_ctx),
             )?;
-            let prefix = query.get("prefix").cloned().unwrap_or_default();
-            let max_keys = query
-                .get("max-keys")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(1000)
-                .min(1000);
-            let start_after = query
-                .get("start-after")
-                .or_else(|| query.get("continuation-token"))
-                .map(|s| s.as_str());
-            let (entries, truncated) =
-                state
-                    .store
-                    .list_objects(bucket, &prefix, start_after, max_keys)?;
-            let next = if truncated {
-                entries.last().map(|e| e.key.as_str())
+
+            let (start_after, continuation_token, marker) = if is_v2 {
+                let ct = query
+                    .get("continuation-token")
+                    .map(|s| s.as_str())
+                    .filter(|s| !s.is_empty());
+                let sa = query
+                    .get("start-after")
+                    .map(|s| s.as_str())
+                    .filter(|s| !s.is_empty());
+                let effective = ct.or(sa);
+                (effective, query.get("continuation-token").map(|s| s.as_str()), None)
             } else {
-                None
+                let m = query.get("marker").map(|s| s.as_str());
+                (m.filter(|s| !s.is_empty()), None, m)
             };
-            let body = xml::list_objects_v2_xml(
-                bucket,
-                &prefix,
-                max_keys,
-                truncated,
-                &entries,
-                next,
-            );
-            state.metrics.s3_requests.with_label_values(&["GET", "200", "ListObjectsV2"]).inc();
+
+            let result = state.store.list_objects(bucket, &prefix, start_after, delimiter, max_keys)?;
+            let owner_pair = (info.owner.as_str(), info.owner_display_name.as_str());
+            // V1 always returns Owner; V2 only when fetch-owner is true.
+            let include_owner = !is_v2
+                || query
+                    .get("fetch-owner")
+                    .map(|s| s.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false);
+            let owner = include_owner.then_some(owner_pair);
+
+            let body = if is_v2 {
+                xml::list_objects_v2_xml(
+                    bucket,
+                    &prefix,
+                    delimiter,
+                    max_keys,
+                    result.truncated,
+                    &result.contents,
+                    &result.common_prefixes,
+                    result.next_token.as_deref(),
+                    query.get("start-after").map(|s| s.as_str()),
+                    continuation_token,
+                    encoding_type,
+                    owner,
+                )
+            } else {
+                xml::list_objects_v1_xml(
+                    bucket,
+                    &prefix,
+                    delimiter,
+                    marker,
+                    max_keys,
+                    result.truncated,
+                    &result.contents,
+                    &result.common_prefixes,
+                    result.next_token.as_deref(),
+                    encoding_type,
+                    owner,
+                )
+            };
+            let label = if is_v2 { "ListObjectsV2" } else { "ListObjects" };
+            state.metrics.s3_requests.with_label_values(&["GET", "200", label]).inc();
             Ok(xml_ok(body, request_id))
         }
         _ => Err(FlashError::InvalidRequest("unsupported bucket method".into())),
@@ -722,6 +1012,51 @@ async fn object_ops(
     }
     if let Some(upload_id) = query.get("uploadId") {
         if query.contains_key("partNumber") && *method == Method::PUT {
+            // UploadPartCopy takes precedence when a copy source is present.
+            if headers.contains_key("x-amz-copy-source") {
+                let pn: i32 = query
+                    .get("partNumber")
+                    .and_then(|s| s.parse().ok())
+                    .ok_or_else(|| FlashError::InvalidRequest("partNumber".into()))?;
+                if !ctx.is_authenticated() {
+                    return Err(FlashError::AccessDenied);
+                }
+                let copy_src = headers
+                    .get("x-amz-copy-source")
+                    .and_then(|v| v.to_str().ok())
+                    .ok_or_else(|| FlashError::InvalidRequest("missing copy source".into()))?;
+                let src = copy_src.trim_start_matches('/');
+                let (src_bucket, src_key_raw) = src
+                    .split_once('/')
+                    .ok_or_else(|| FlashError::InvalidRequest("bad copy source".into()))?;
+                let src_key =
+                    ObjectKey::new(urlencoding::decode(src_key_raw).unwrap_or_default().as_ref())
+                        .map_err(|_| FlashError::InvalidObjectName)?;
+                let range = headers
+                    .get("x-amz-copy-source-range")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| {
+                        let s = v.strip_prefix("bytes=")?;
+                        let (start, end) = s.split_once('-')?;
+                        Some((start.parse::<u64>().ok()?, end.parse::<u64>().ok()?))
+                    });
+                let (etag, last_modified) = state
+                    .store
+                    .upload_part_copy(
+                        bucket,
+                        upload_id,
+                        pn,
+                        src_bucket,
+                        &src_key,
+                        range,
+                        &state.sse_key,
+                    )
+                    .await?;
+                return Ok(xml_ok(
+                    xml::copy_part_result_xml(&etag, &last_modified),
+                    request_id,
+                ));
+            }
             let pn: i32 = query
                 .get("partNumber")
                 .and_then(|s| s.parse().ok())
@@ -747,6 +1082,36 @@ async fn object_ops(
     if query.contains_key("acl") {
         return object_acl_ops(state, ctx, method, bucket, key, &body, headers, request_id).await;
     }
+
+    // Object tagging
+    if query.contains_key("tagging") {
+        let info = state.store.get_bucket(bucket).await?;
+        let policy = state.store.load_policy(bucket).await?;
+        match *method {
+            Method::GET => {
+                let meta = state.store.get_object_meta(bucket, key).await?;
+                state.authorizer.authorize(ctx, S3Action::GetObjectTagging, Some(&info), Some(&meta), policy.as_ref())?;
+                let tags = state.store.get_object_tags(bucket, key).await?;
+                return Ok(xml_ok(xml::tagging_xml(&tags), request_id));
+            }
+            Method::PUT => {
+                state.authorizer.authorize(ctx, S3Action::PutObjectTagging, Some(&info), None, policy.as_ref())?;
+                let raw = std::str::from_utf8(&body)
+                    .map_err(|_| FlashError::InvalidRequest("invalid tagging xml".into()))?;
+                let tags = xml::parse_tagging_xml(raw)?;
+                state.store.put_object_tags(bucket, key, &tags).await?;
+                return Ok(StatusCode::OK.into_response());
+            }
+            Method::DELETE => {
+                state.authorizer.authorize(ctx, S3Action::DeleteObjectTagging, Some(&info), None, policy.as_ref())?;
+                state.store.delete_object_tags(bucket, key).await?;
+                return Ok(StatusCode::NO_CONTENT.into_response());
+            }
+            _ => return Err(FlashError::InvalidRequest("bad tagging method".into())),
+        }
+    }
+
+    // UploadPartCopy is handled earlier (before plain UploadPart).
 
     match *method {
         Method::PUT => {
@@ -818,7 +1183,6 @@ async fn put_object(
     request_id: &str,
 ) -> Result<Response, FlashError> {
     if !ctx.is_authenticated() {
-        // public-read-write bucket ACL may allow
         let info = state.store.get_bucket(bucket).await?;
         let policy = state.store.load_policy(bucket).await?;
         state.authorizer.authorize(
@@ -831,7 +1195,6 @@ async fn put_object(
     } else {
         let info = state.store.get_bucket(bucket).await?;
         let policy = state.store.load_policy(bucket).await?;
-        // For overwrite, check object ACL if exists
         let obj = state.store.get_object_meta(bucket, key).await.ok();
         state.authorizer.authorize(
             ctx,
@@ -842,23 +1205,56 @@ async fn put_object(
         )?;
     }
 
+    // Conditional PutObject preconditions
+    check_put_preconditions(state, bucket, key, headers).await?;
+
     let info = state.store.get_bucket(bucket).await?;
     let owner = ctx.key.as_ref().ok_or(FlashError::AccessDenied)?;
-    let opts = put_object_opts(headers, owner, info.default_object_acl);
+    let mut opts = put_object_opts(headers, owner, info.default_object_acl);
+
+    // Checksums verification and collection
+    let computed_checksums = verify_checksums(&body, headers)?;
+    for (k, v) in &computed_checksums {
+        opts.checksums.entry(k.clone()).or_insert_with(|| v.clone());
+    }
+
+    // SSE-S3 encryption
+    let final_body = if request_wants_sse_s3(headers) {
+        let plaintext_md5 = md5_etag_of(&body);
+        let (ciphertext, nonce) = sse_encrypt(&state.sse_key, &body)?;
+        opts.sse_s3 = true;
+        opts.sse_nonce = Some(nonce);
+        opts.plaintext_size = Some(body.len() as u64);
+        opts.etag_override = Some(plaintext_md5);
+        Bytes::from(ciphertext)
+    } else {
+        body.clone()
+    };
 
     let meta = state
         .store
-        .put_object(bucket, key, body.clone(), opts)
+        .put_object(bucket, key, final_body.clone(), opts)
         .await?;
 
-    if (meta.size) <= state.cache.object_max_bytes() {
-        state.cache.insert(bucket, key.as_str(), body).await;
+    if meta.size <= state.cache.object_max_bytes() {
+        if meta.sse_s3 {
+            state.cache.invalidate(bucket, key.as_str()).await;
+        } else {
+            state.cache.insert(bucket, key.as_str(), final_body).await;
+        }
     } else {
         state.cache.invalidate(bucket, key.as_str()).await;
     }
 
+    let mut resp = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::ETAG, &meta.etag)
+        .header("x-amz-request-id", request_id);
+    if meta.sse_s3 {
+        resp = resp.header("x-amz-server-side-encryption", "AES256");
+    }
     state.metrics.s3_requests.with_label_values(&["PUT", "200", "PutObject"]).inc();
-    Ok(etag_ok(&meta.etag, request_id))
+    Ok(resp.body(Body::empty()).unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()))
 }
 
 async fn put_object_stream(
@@ -866,10 +1262,34 @@ async fn put_object_stream(
     ctx: &AuthContext,
     bucket: &str,
     key: &ObjectKey,
-    reader: impl tokio::io::AsyncRead + Unpin,
+    mut reader: impl tokio::io::AsyncRead + Unpin,
     headers: &HeaderMap,
     request_id: &str,
 ) -> Result<Response, FlashError> {
+    use tokio::io::AsyncReadExt;
+
+    // Signed requests usually hit this streaming path. When the client declares
+    // flexible checksums or SSE-S3, buffer the body so we can verify/encrypt.
+    let needs_buffer = request_wants_sse_s3(headers)
+        || headers.keys().any(|name| name.as_str().starts_with("x-amz-checksum-"));
+    if needs_buffer {
+        let mut buf = Vec::new();
+        reader
+            .read_to_end(&mut buf)
+            .await
+            .map_err(|e| FlashError::Internal(e.to_string()))?;
+        return put_object(
+            state,
+            ctx,
+            bucket,
+            key,
+            Bytes::from(buf),
+            headers,
+            request_id,
+        )
+        .await;
+    }
+
     let info = state.store.get_bucket(bucket).await?;
     let policy = state.store.load_policy(bucket).await?;
     let object = if ctx.is_authenticated() {
@@ -884,6 +1304,8 @@ async fn put_object_stream(
         object.as_ref(),
         policy.as_ref(),
     )?;
+
+    check_put_preconditions(state, bucket, key, headers).await?;
 
     let owner = ctx.key.as_ref().ok_or(FlashError::AccessDenied)?;
     let opts = put_object_opts(headers, owner, info.default_object_acl);
@@ -935,6 +1357,17 @@ async fn get_object(
             return Ok(range_not_satisfiable_response(meta.size, request_id));
         }
     };
+
+    // SSE-S3: decrypt and serve in-memory
+    if meta.sse_s3 {
+        let (meta, plaintext) = state.store.read_object_plaintext(bucket, key, &state.sse_key).await?;
+        state.metrics.s3_requests.with_label_values(&["GET", "200", "GetObject"]).inc();
+        if let Some(range) = range {
+            let bytes = plaintext.slice(range.start as usize..=range.end as usize);
+            return Ok(partial_object_response(&meta, Body::from(bytes), range, request_id));
+        }
+        return Ok(object_response(&meta, Body::from(plaintext), request_id));
+    }
 
     // Cache hit for small objects
     if let Some(cached) = state.cache.get(bucket, key.as_str()).await {
@@ -1069,6 +1502,40 @@ async fn copy_object(
         src_policy.as_ref(),
     )?;
 
+    // Conditional copy-source preconditions
+    if let Some(val) = headers.get("x-amz-copy-source-if-match").and_then(|v| v.to_str().ok()) {
+        let matches = val.split(',').map(str::trim).any(|t| t == "*" || t == src_meta.etag);
+        if !matches {
+            return Err(FlashError::PreconditionFailed);
+        }
+    }
+    if let Some(val) = headers.get("x-amz-copy-source-if-none-match").and_then(|v| v.to_str().ok()) {
+        let matches = val.split(',').map(str::trim).any(|t| t == "*" || t == src_meta.etag);
+        if matches {
+            return Err(FlashError::PreconditionFailed);
+        }
+    }
+    if let Some(val) = headers.get("x-amz-copy-source-if-modified-since").and_then(|v| v.to_str().ok()) {
+        if let (Ok(since), Ok(modified)) = (
+            DateTime::parse_from_rfc2822(val),
+            DateTime::parse_from_rfc3339(&src_meta.last_modified),
+        ) {
+            if modified <= since {
+                return Err(FlashError::PreconditionFailed);
+            }
+        }
+    }
+    if let Some(val) = headers.get("x-amz-copy-source-if-unmodified-since").and_then(|v| v.to_str().ok()) {
+        if let (Ok(since), Ok(modified)) = (
+            DateTime::parse_from_rfc2822(val),
+            DateTime::parse_from_rfc3339(&src_meta.last_modified),
+        ) {
+            if modified > since {
+                return Err(FlashError::PreconditionFailed);
+            }
+        }
+    }
+
     let dst_info = state.store.get_bucket(dst_bucket).await?;
     let dst_policy = state.store.load_policy(dst_bucket).await?;
     state.authorizer.authorize(
@@ -1084,20 +1551,101 @@ async fn copy_object(
         .get("x-amz-acl")
         .and_then(|v| v.to_str().ok())
         .and_then(CannedAcl::parse);
+
+    // metadata-directive: REPLACE uses request headers; COPY (default) keeps src
+    let metadata_directive = headers
+        .get("x-amz-metadata-directive")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("COPY");
+
+    let (user_meta, content_type, content_encoding, cache_control, content_disposition, content_language, expires, checksums) =
+        if metadata_directive.eq_ignore_ascii_case("REPLACE") {
+            let hv = |name: &str| headers.get(name).and_then(|v| v.to_str().ok()).map(ToOwned::to_owned);
+            (
+                extract_user_meta(headers),
+                hv("content-type"),
+                hv("content-encoding"),
+                hv("cache-control"),
+                hv("content-disposition"),
+                hv("content-language"),
+                hv("expires"),
+                std::collections::HashMap::new(),
+            )
+        } else {
+            (
+                src_meta.user_meta.clone(),
+                Some(src_meta.content_type.clone()),
+                src_meta.content_encoding.clone(),
+                src_meta.cache_control.clone(),
+                src_meta.content_disposition.clone(),
+                src_meta.content_language.clone(),
+                src_meta.expires.clone(),
+                src_meta.checksums.clone(),
+            )
+        };
+
+    // If SSE is needed (src encrypted or dst wants SSE): read plaintext, then put with encrypt
+    let dst_wants_sse = request_wants_sse_s3(headers);
+    if src_meta.sse_s3 || dst_wants_sse {
+        let (_src_m, plaintext) = state.store.read_object_plaintext(src_bucket, &src_key, &state.sse_key).await?;
+        let mut opts = PutObjectOpts {
+            content_type: content_type.or(Some(src_meta.content_type.clone())),
+            canned_acl: canned,
+            acl: None,
+            owner: owner.canonical_id.clone(),
+            owner_display_name: owner.display_name.clone(),
+            default_object_acl: dst_info.default_object_acl,
+            user_meta,
+            content_encoding,
+            cache_control,
+            content_disposition,
+            content_language,
+            expires,
+            checksums,
+            sse_s3: false,
+            sse_nonce: None,
+            plaintext_size: None,
+            etag_override: None,
+        };
+        let final_body = if dst_wants_sse {
+            let plaintext_md5 = md5_etag_of(&plaintext);
+            let (ciphertext, nonce) = sse_encrypt(&state.sse_key, &plaintext)?;
+            opts.sse_s3 = true;
+            opts.sse_nonce = Some(nonce);
+            opts.plaintext_size = Some(plaintext.len() as u64);
+            opts.etag_override = Some(plaintext_md5);
+            Bytes::from(ciphertext)
+        } else {
+            plaintext
+        };
+        let meta = state.store.put_object(dst_bucket, dst_key, final_body, opts).await?;
+        let body = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?><CopyObjectResult><LastModified>{}</LastModified><ETag>{}</ETag></CopyObjectResult>"#,
+            xml_escape(&meta.last_modified),
+            xml_escape(&meta.etag)
+        );
+        state.metrics.s3_requests.with_label_values(&["PUT", "200", "CopyObject"]).inc();
+        return Ok(xml_ok(body, request_id));
+    }
+
     let opts = PutObjectOpts {
-        content_type: Some(src_meta.content_type.clone()),
+        content_type: content_type.or(Some(src_meta.content_type.clone())),
         canned_acl: canned,
         acl: None,
         owner: owner.canonical_id.clone(),
         owner_display_name: owner.display_name.clone(),
         default_object_acl: dst_info.default_object_acl,
-        user_meta: src_meta.user_meta.clone(),
-        content_encoding: src_meta.content_encoding.clone(),
-        cache_control: src_meta.cache_control.clone(),
-        content_disposition: src_meta.content_disposition.clone(),
-        content_language: src_meta.content_language.clone(),
-        expires: src_meta.expires.clone(),
-        checksums: src_meta.checksums.clone(),
+        user_meta,
+        content_encoding,
+        cache_control,
+        content_disposition,
+        content_language,
+        expires,
+        checksums,
+        sse_s3: false,
+        sse_nonce: None,
+        plaintext_size: None,
+        etag_override: None,
     };
     let meta = state
         .store
@@ -1374,6 +1922,9 @@ fn object_response_with_status(
     if let Some(value) = &meta.content_encoding {
         builder = builder.header(header::CONTENT_ENCODING, value);
     }
+    if meta.sse_s3 {
+        builder = builder.header("x-amz-server-side-encryption", "AES256");
+    }
     for (name, value) in [
         ("cache-control", meta.cache_control.as_deref()),
         ("content-disposition", meta.content_disposition.as_deref()),
@@ -1385,7 +1936,9 @@ fn object_response_with_status(
         }
     }
     for (name, value) in &meta.user_meta {
-        builder = builder.header(format!("x-amz-meta-{name}"), value);
+        if let Some(hv) = meta_to_header_value(value) {
+            builder = builder.header(format!("x-amz-meta-{name}"), hv);
+        }
     }
     for (name, value) in &meta.checksums {
         builder = builder.header(name, value);
@@ -1653,14 +2206,55 @@ fn parse_query(q: &str) -> BTreeMap<String, String> {
     map
 }
 
+fn parse_list_max_keys(raw: Option<&str>) -> Result<usize, FlashError> {
+    match raw {
+        None | Some("") => Ok(1000),
+        Some(s) => {
+            let n: i64 = s.parse().map_err(|_| {
+                FlashError::InvalidArgument(format!("Provided max-keys not an integer or within integer range: {s}"))
+            })?;
+            if n < 0 {
+                return Err(FlashError::InvalidArgument(format!(
+                    "Argument max-keys must be an integer between 0 and 2147483647"
+                )));
+            }
+            Ok((n as usize).min(1000))
+        }
+    }
+}
+
+/// Read a header value as a string, including opaque / ISO-8859-1 bytes.
+///
+/// `HeaderValue::to_str` only accepts visible ASCII. Prefer UTF-8 (botocore may
+/// send Unicode metadata as UTF-8 on the wire); fall back to ISO-8859-1.
+fn header_value_string(value: &HeaderValue) -> String {
+    match std::str::from_utf8(value.as_bytes()) {
+        Ok(s) => s.to_string(),
+        Err(_) => value.as_bytes().iter().map(|&b| b as char).collect(),
+    }
+}
+
+/// Encode a stored metadata string back to an HTTP header value.
+///
+/// Emit ISO-8859-1 when all codepoints fit in a byte so Latin-1 clients
+/// (botocore metadata parsing) round-trip Unicode like `é` correctly.
+fn meta_to_header_value(value: &str) -> Option<HeaderValue> {
+    if value.is_ascii() {
+        return HeaderValue::from_str(value).ok();
+    }
+    if value.chars().all(|c| u32::from(c) <= 0xFF) {
+        let bytes: Vec<u8> = value.chars().map(|c| u32::from(c) as u8).collect();
+        return HeaderValue::from_bytes(&bytes).ok();
+    }
+    HeaderValue::from_bytes(value.as_bytes()).ok()
+}
+
 fn extract_user_meta(headers: &HeaderMap) -> std::collections::HashMap<String, String> {
     let mut m = std::collections::HashMap::new();
     for (k, v) in headers.iter() {
         let name = k.as_str();
         if let Some(rest) = name.strip_prefix("x-amz-meta-") {
-            if let Ok(val) = v.to_str() {
-                m.insert(rest.to_string(), val.to_string());
-            }
+            m.insert(rest.to_string(), header_value_string(v));
         }
     }
     m
@@ -1709,6 +2303,10 @@ fn put_object_opts(
         content_language: header_value("content-language"),
         expires: header_value("expires"),
         checksums,
+        sse_s3: false,
+        sse_nonce: None,
+        plaintext_size: None,
+        etag_override: None,
     }
 }
 
@@ -1774,6 +2372,13 @@ fn resolve_acl_from_request(
         return xml::parse_acl_xml(raw, current);
     }
     Err(FlashError::MalformedAcl)
+}
+
+/// MD5 ETag for plaintext (used for SSE-S3 overrides).
+fn md5_etag_of(data: &[u8]) -> String {
+    let mut h = md5::Md5::new();
+    h.update(data);
+    format!("\"{}\"", hex::encode(h.finalize()))
 }
 
 // silence unused ApiError

@@ -28,6 +28,9 @@ http = "1"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["server", "http1"] }
 md-5 = "0.10"
+crc = "3"
+crc32c = "0.6"
+sha1 = "0.10"
 moka = { version = "0.12", features = ["future"] }
 parking_lot = "0.12"
 prometheus = "0.13"

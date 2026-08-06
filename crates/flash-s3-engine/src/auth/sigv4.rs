@@ -236,9 +236,14 @@ fn build_canonical_headers(headers: &HeaderMap, signed: &str) -> Result<String, 
                     None
                 }
             })
-            .and_then(|v| v.to_str().ok())
             .ok_or(FlashError::SignatureDoesNotMatch)?;
-        let collapsed = collapse_ws(value);
+        // Prefer UTF-8 (botocore canonicalizes Unicode as UTF-8); else ISO-8859-1.
+        // `HeaderValue::to_str` only allows visible ASCII and would reject both.
+        let raw = match std::str::from_utf8(value.as_bytes()) {
+            Ok(s) => s.to_string(),
+            Err(_) => value.as_bytes().iter().map(|&b| b as char).collect(),
+        };
+        let collapsed = collapse_ws(&raw);
         out.push_str(name);
         out.push(':');
         out.push_str(&collapsed);

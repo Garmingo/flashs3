@@ -26,6 +26,10 @@ fn opts(owner: &CanonicalUserId) -> PutObjectOpts {
         content_language: None,
         expires: None,
         checksums: Default::default(),
+        sse_s3: false,
+        sse_nonce: None,
+        plaintext_size: None,
+        etag_override: None,
     }
 }
 
@@ -53,7 +57,10 @@ async fn create_put_get_delete_object() {
     assert_eq!(got, body);
     assert_eq!(got_meta.etag, meta.etag);
 
-    let (entries, truncated) = store.list_objects("demo", "a/", None, 100).unwrap();
+    let (entries, truncated) = {
+        let r = store.list_objects("demo", "a/", None, None, 100).unwrap();
+        (r.contents, r.truncated)
+    };
     assert!(!truncated);
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].key, "a/b.txt");
@@ -324,7 +331,7 @@ async fn bucket_policy_roundtrip() {
     assert_eq!(store.get_bucket_policy("pol").await.unwrap(), raw);
     let parsed = store.load_policy("pol").await.unwrap().unwrap();
     assert_eq!(
-        parsed.evaluate("s3:GetObject", "arn:aws:s3:::pol/k", None),
+        parsed.evaluate("s3:GetObject", "arn:aws:s3:::pol/k", None, None),
         Some(true)
     );
 }

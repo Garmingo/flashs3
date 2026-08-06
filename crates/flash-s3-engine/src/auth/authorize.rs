@@ -8,7 +8,7 @@
 //!
 //! Root keys may bypass when [`Authorizer::root_bypasses`] is true.
 
-use flash_s3_common::{AccessControlPolicy, BucketPolicy, CanonicalUserId, FlashError, Permission};
+use flash_s3_common::{AccessControlPolicy, BucketPolicy, CanonicalUserId, FlashError, Permission, PolicyConditionCtx};
 
 use super::credentials::StoredKey;
 use super::sigv4::ChunkSigning;
@@ -93,11 +93,21 @@ pub enum S3Action {
     GetBucketCors,
     PutBucketCors,
     DeleteBucketCors,
+    GetBucketLocation,
+    GetBucketTagging,
+    PutBucketTagging,
+    DeleteBucketTagging,
+    ListBucketMultipartUploads,
     GetObject,
     PutObject,
     DeleteObject,
     GetObjectAcl,
     PutObjectAcl,
+    GetObjectTagging,
+    PutObjectTagging,
+    DeleteObjectTagging,
+    ListMultipartUploadParts,
+    AbortMultipartUpload,
 }
 
 impl S3Action {
@@ -117,19 +127,43 @@ impl S3Action {
             Self::GetBucketCors => "s3:GetBucketCors",
             Self::PutBucketCors => "s3:PutBucketCors",
             Self::DeleteBucketCors => "s3:DeleteBucketCors",
+            Self::GetBucketLocation => "s3:GetBucketLocation",
+            Self::GetBucketTagging => "s3:GetBucketTagging",
+            Self::PutBucketTagging => "s3:PutBucketTagging",
+            Self::DeleteBucketTagging => "s3:DeleteBucketTagging",
+            Self::ListBucketMultipartUploads => "s3:ListBucketMultipartUploads",
             Self::GetObject => "s3:GetObject",
             Self::PutObject => "s3:PutObject",
             Self::DeleteObject => "s3:DeleteObject",
             Self::GetObjectAcl => "s3:GetObjectAcl",
             Self::PutObjectAcl => "s3:PutObjectAcl",
+            Self::GetObjectTagging => "s3:GetObjectTagging",
+            Self::PutObjectTagging => "s3:PutObjectTagging",
+            Self::DeleteObjectTagging => "s3:DeleteObjectTagging",
+            Self::ListMultipartUploadParts => "s3:ListMultipartUploadParts",
+            Self::AbortMultipartUpload => "s3:AbortMultipartUpload",
         }
     }
 
     /// ACL permission bit required for this action, if ACL-governed.
     pub fn acl_permission(self) -> Option<Permission> {
         match self {
-            Self::GetObject | Self::ListBucket | Self::HeadBucket => Some(Permission::Read),
-            Self::PutObject | Self::DeleteObject | Self::CreateBucket => Some(Permission::Write),
+            Self::GetObject
+            | Self::ListBucket
+            | Self::HeadBucket
+            | Self::GetBucketLocation
+            | Self::GetObjectTagging
+            | Self::GetBucketTagging
+            | Self::ListBucketMultipartUploads
+            | Self::ListMultipartUploadParts => Some(Permission::Read),
+            Self::PutObject
+            | Self::DeleteObject
+            | Self::CreateBucket
+            | Self::PutObjectTagging
+            | Self::DeleteObjectTagging
+            | Self::PutBucketTagging
+            | Self::DeleteBucketTagging
+            | Self::AbortMultipartUpload => Some(Permission::Write),
             Self::GetBucketAcl | Self::GetObjectAcl => Some(Permission::ReadAcp),
             Self::PutBucketAcl | Self::PutObjectAcl => Some(Permission::WriteAcp),
             _ => None,
@@ -172,6 +206,19 @@ impl Authorizer {
         object: Option<&ObjectMeta>,
         policy: Option<&BucketPolicy>,
     ) -> Result<(), FlashError> {
+        self.authorize_with_ctx(ctx, action, bucket, object, policy, None)
+    }
+
+    /// Authorize with optional policy condition context (for ListBucket prefix/delimiter).
+    pub fn authorize_with_ctx(
+        &self,
+        ctx: &AuthContext,
+        action: S3Action,
+        bucket: Option<&BucketInfo>,
+        object: Option<&ObjectMeta>,
+        policy: Option<&BucketPolicy>,
+        condition_ctx: Option<&PolicyConditionCtx<'_>>,
+    ) -> Result<(), FlashError> {
         if self.root_bypasses && ctx.is_root() {
             return Ok(());
         }
@@ -186,7 +233,7 @@ impl Authorizer {
 
         if let Some(pol) = policy {
             if let Some(decision) =
-                pol.evaluate(action.as_policy_action(), &resource, ctx.access_key())
+                pol.evaluate(action.as_policy_action(), &resource, ctx.access_key(), condition_ctx)
             {
                 return if decision {
                     Ok(())
@@ -194,11 +241,10 @@ impl Authorizer {
                     Err(FlashError::AccessDenied)
                 };
             }
-            // Also try wildcard object resource for GetObject etc.
             if let Some(b) = bucket {
                 let wild = format!("arn:aws:s3:::{}/*", b.name);
                 if let Some(decision) =
-                    pol.evaluate(action.as_policy_action(), &wild, ctx.access_key())
+                    pol.evaluate(action.as_policy_action(), &wild, ctx.access_key(), condition_ctx)
                 {
                     return if decision {
                         Ok(())

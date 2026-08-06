@@ -9,7 +9,7 @@ use flash_s3_common::{
     ENV_CACHE_MAX_BYTES, ENV_CACHE_OBJECT_MAX_BYTES, ENV_CACHE_POLICY, ENV_CREDENTIALS_KEY,
     ENV_DATA_DIR, ENV_DEFAULT_BUCKET_CORS, ENV_DEFAULT_BUCKET_CORS_ALLOW_ALL,
     ENV_DEFAULT_BUCKET_NAME, ENV_DEFAULT_OBJECT_ACL, ENV_REGION, ENV_ROOT_BYPASSES_ACL,
-    ENV_SECRET_KEY,
+    ENV_SECRET_KEY, ENV_SSE_S3_KEY, ENV_VIRTUAL_HOST_BASE,
 };
 
 /// Process configuration for `flash-s3-engine`.
@@ -93,6 +93,14 @@ pub struct Config {
     /// Allow root keys to bypass ACL/policy checks.
     #[arg(long, env = ENV_ROOT_BYPASSES_ACL, default_value_t = true)]
     pub root_bypasses_acl: bool,
+
+    /// Optional passphrase for deriving the SSE-S3 AES-256 key.
+    #[arg(long, env = ENV_SSE_S3_KEY)]
+    pub sse_s3_key: Option<String>,
+
+    /// DNS base for virtual-hosted-style addressing (e.g. `s3.localhost`).
+    #[arg(long, env = ENV_VIRTUAL_HOST_BASE)]
+    pub virtual_host_base: Option<String>,
 }
 
 impl Config {
