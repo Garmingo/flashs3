@@ -287,6 +287,17 @@ impl ObjectStore {
         atomic_write_json(&layout::bucket_json_path(&self.data_dir, name), &info).await
     }
 
+    /// Update the default canned ACL used for new objects without `x-amz-acl`.
+    pub async fn set_default_object_acl(
+        &self,
+        name: &str,
+        default_object_acl: CannedAcl,
+    ) -> Result<(), FlashError> {
+        let mut info = self.get_bucket(name).await?;
+        info.default_object_acl = default_object_acl;
+        atomic_write_json(&layout::bucket_json_path(&self.data_dir, name), &info).await
+    }
+
     pub async fn put_bucket_policy(&self, name: &str, raw: &str) -> Result<(), FlashError> {
         let _ = self.get_bucket(name).await?;
         let _ = BucketPolicy::parse_json(raw)?;

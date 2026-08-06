@@ -188,7 +188,7 @@ spec:
   retainPvc: true
 ```
 
-Credentials: if `spec.auth.secretRef` is omitted, the operator creates a Secret with a cryptographically random `accessKey` (`flash_ak_` + 32 chars) and `secretKey` (`flash_sk_` + 64 chars) via OS CSPRNG; created once, never rotated. `spec.defaultBucketName` is optional; when set, the engine creates that bucket idempotently on startup. `spec.cors` is optional and requires `defaultBucketName`; use either `allowAll: true` (permissive, local/dev) or explicit `rules` (not both). The operator maps this to `FLASHS3_DEFAULT_BUCKET_CORS_ALLOW_ALL` / `FLASHS3_DEFAULT_BUCKET_CORS`, and the engine writes `cors.xml` on start. CORS can also be managed at runtime with the S3 API (`put-bucket-cors`). The resulting endpoint is, for example, `http://media.default.svc:9000`.
+Credentials: if `spec.auth.secretRef` is omitted, the operator creates a Secret with a cryptographically random `accessKey` (`flash_ak_` + 32 chars) and `secretKey` (`flash_sk_` + 64 chars) via OS CSPRNG; created once, never rotated. `spec.defaultBucketName` is optional; when set, the engine creates that bucket idempotently on startup. `spec.defaultObjectAcl` and `spec.cors` are re-applied to that bucket on **every** engine start (change the CR and restart/roll the pod). `spec.cors` requires `defaultBucketName`; use either `allowAll: true` (permissive, local/dev) or explicit `rules` (not both). Removing `spec.cors` leaves an existing `cors.xml` unchanged. The operator maps CORS to `FLASHS3_DEFAULT_BUCKET_CORS_ALLOW_ALL` / `FLASHS3_DEFAULT_BUCKET_CORS`. CORS can also be managed at runtime with the S3 API (`put-bucket-cors`). The resulting endpoint is, for example, `http://media.default.svc:9000`.
 
 ## Env
 

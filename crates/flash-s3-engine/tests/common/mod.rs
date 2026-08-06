@@ -183,3 +183,38 @@ pub async fn anon_request_with_headers(
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     (status, resp_headers, bytes)
 }
+
+/// Build a SigV4 query string for a presigned PUT (no leading `?`).
+pub fn presigned_put_query(path: &str, expires: u32) -> String {
+    let now = Utc::now();
+    let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
+    let date = now.format("%Y%m%d").to_string();
+    let credential = format!("{ACCESS}/{date}/{REGION}/s3/aws4_request");
+    let mut query: BTreeMap<String, String> = BTreeMap::new();
+    query.insert("X-Amz-Algorithm".into(), "AWS4-HMAC-SHA256".into());
+    query.insert("X-Amz-Credential".into(), credential);
+    query.insert("X-Amz-Date".into(), amz_date.clone());
+    query.insert("X-Amz-Expires".into(), expires.to_string());
+    query.insert("X-Amz-SignedHeaders".into(), "host".into());
+    query.insert("x-id".into(), "PutObject".into());
+
+    let mut parts = Vec::with_capacity(query.len());
+    for (k, v) in &query {
+        parts.push(format!("{}={}", uri_encode(k), uri_encode(v)));
+    }
+    let canonical_query = parts.join("&");
+    let canonical_request = format!(
+        "PUT\n{path}\n{canonical_query}\nhost:127.0.0.1:9000\n\nhost\nUNSIGNED-PAYLOAD"
+    );
+    let scope = format!("{date}/{REGION}/s3/aws4_request");
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
+        hex::encode(Sha256::digest(canonical_request.as_bytes()))
+    );
+    let k_date = hmac_sha256(format!("AWS4{SECRET}").as_bytes(), date.as_bytes());
+    let k_region = hmac_sha256(&k_date, REGION.as_bytes());
+    let k_service = hmac_sha256(&k_region, b"s3");
+    let k_signing = hmac_sha256(&k_service, b"aws4_request");
+    let signature = hex::encode(hmac_sha256(&k_signing, string_to_sign.as_bytes()));
+    format!("{canonical_query}&X-Amz-Signature={signature}")
+}

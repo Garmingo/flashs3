@@ -141,6 +141,21 @@ async fn dispatch_inner(
     // SigV4 signs the percent-encoded request path. `Path<String>` is decoded
     // by Axum, so retain the raw URI path for signature verification.
     let path_str = uri.path().to_string();
+
+    // Browser CORS preflight for a presigned PUT/GET hits the same URL including
+    // `X-Amz-Signature` query params. Auth must be skipped: the signature was
+    // computed for the actual method (e.g. PUT), not OPTIONS. AWS S3 likewise
+    // evaluates only the bucket CORS config for OPTIONS.
+    if method == Method::OPTIONS {
+        let path = path.ok_or_else(|| FlashError::InvalidRequest("missing path".into()))?;
+        let bucket = path
+            .split('/')
+            .find(|segment| !segment.is_empty())
+            .ok_or_else(|| FlashError::InvalidRequest("empty path".into()))?;
+        drop(body);
+        return handle_options_cors(&state, bucket, &headers, request_id).await;
+    }
+
     let has_object_key = path
         .as_deref()
         .map(|p| p.split('/').filter(|segment| !segment.is_empty()).count() > 1)

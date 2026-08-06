@@ -58,9 +58,10 @@ impl AppState {
     /// The operation is idempotent so restarts retain the existing bucket and
     /// its contents. A root credential is required to own the initial bucket.
     ///
-    /// When [`Config::default_bucket_cors`] is set, the CORS configuration is
-    /// (re)applied after the bucket exists so CRD/env changes take effect on
-    /// restart without a separate S3 API call.
+    /// On every start (including when the bucket already exists):
+    /// - [`Config::default_object_acl`] is written to `bucket.json`
+    /// - when CORS env is set, the CORS configuration is (re)applied so CRD/env
+    ///   changes take effect after a pod restart without a separate S3 API call
     pub async fn initialize_default_bucket(&self) -> Result<(), FlashError> {
         let Some(name) = self.config.default_bucket_name.as_deref() else {
             if self.config.default_bucket_cors_allow_all || self.config.default_bucket_cors.is_some()
@@ -96,6 +97,11 @@ impl AppState {
             Ok(_) | Err(FlashError::BucketAlreadyOwnedByYou) => {}
             Err(error) => return Err(error),
         }
+
+        // Re-apply on every start so CRD/env changes take effect after restart.
+        self.store
+            .set_default_object_acl(name, self.config.default_object_acl())
+            .await?;
 
         let cors = if self.config.default_bucket_cors_allow_all {
             Some(CorsConfiguration::allow_all())

@@ -7,7 +7,10 @@ use std::collections::BTreeMap;
 use bytes::Bytes;
 use chrono::DateTime;
 use flash_s3_engine::api::router;
-use common::{anon_request, anon_request_with_headers, app_state, sign_headers, signed_request};
+use common::{
+    anon_request, anon_request_with_headers, app_state, presigned_put_query, sign_headers,
+    signed_request,
+};
 use axum::body::Body;
 use http::{Method, Request, StatusCode};
 use tower::ServiceExt;
@@ -98,6 +101,83 @@ async fn configured_default_bucket_cors_allow_all() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(headers.get("access-control-allow-origin").unwrap(), "*");
     assert_eq!(headers.get("access-control-allow-methods").unwrap(), "PUT");
+}
+
+#[tokio::test]
+async fn configured_default_bucket_reapplies_acl_and_cors_on_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    // First start: private ACL + origin A
+    let mut config = common::test_config(tmp.path().to_path_buf());
+    config.default_bucket_name = Some("reapply".into());
+    config.default_object_acl = "private".into();
+    config.default_bucket_cors = Some(
+        r#"{"rules":[{"allowedOrigins":["http://localhost:3001"],"allowedMethods":["PUT","GET","HEAD"],"allowedHeaders":["*"]}]}"#
+            .into(),
+    );
+    {
+        let state = flash_s3_engine::AppState::new(config).unwrap();
+        state.initialize_default_bucket().await.unwrap();
+        assert_eq!(
+            state.store.get_bucket("reapply").await.unwrap().default_object_acl,
+            flash_s3_common::CannedAcl::Private
+        );
+        assert!(state
+            .store
+            .get_bucket_cors("reapply")
+            .await
+            .unwrap()
+            .contains("http://localhost:3001"));
+    }
+
+    // Second start (same data dir, first state dropped): public-read + origin B
+    let mut config = common::test_config(tmp.path().to_path_buf());
+    config.default_bucket_name = Some("reapply".into());
+    config.default_object_acl = "public-read".into();
+    config.default_bucket_cors = Some(
+        r#"{"rules":[{"allowedOrigins":["https://app.example.com"],"allowedMethods":["GET","HEAD"],"allowedHeaders":["*"]}]}"#
+            .into(),
+    );
+    let state = flash_s3_engine::AppState::new(config).unwrap();
+    state.initialize_default_bucket().await.unwrap();
+
+    assert_eq!(
+        state.store.get_bucket("reapply").await.unwrap().default_object_acl,
+        flash_s3_common::CannedAcl::PublicRead
+    );
+    let raw = state.store.get_bucket_cors("reapply").await.unwrap();
+    assert!(raw.contains("https://app.example.com"));
+    assert!(!raw.contains("http://localhost:3001"));
+
+    let (status, headers, _) = anon_request_with_headers(
+        &state,
+        Method::OPTIONS,
+        "/reapply/file.bin",
+        &[
+            ("Origin", "https://app.example.com"),
+            ("Access-Control-Request-Method", "GET"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers.get("access-control-allow-origin").unwrap(),
+        "https://app.example.com"
+    );
+
+    // Old origin must no longer match.
+    let (status, headers, _) = anon_request_with_headers(
+        &state,
+        Method::OPTIONS,
+        "/reapply/file.bin",
+        &[
+            ("Origin", "http://localhost:3001"),
+            ("Access-Control-Request-Method", "PUT"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(headers.get("access-control-allow-origin").is_none());
 }
 
 #[tokio::test]
@@ -944,4 +1024,208 @@ async fn cors_malformed_put_rejected() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(String::from_utf8_lossy(&body).contains("MalformedXML"));
+}
+
+/// Regression: browsers send OPTIONS to the *presigned PUT URL* including
+/// `X-Amz-Signature`. Auth must not run (signature is for PUT, not OPTIONS).
+#[tokio::test]
+async fn cors_preflight_on_presigned_put_url_with_allow_all() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = common::test_config(tmp.path().to_path_buf());
+    config.default_bucket_name = Some("liveries".into());
+    config.default_bucket_cors_allow_all = true;
+    let state = flash_s3_engine::AppState::new(config).unwrap();
+    state.initialize_default_bucket().await.unwrap();
+
+    let object_path =
+        "/liveries/pending/eFwnbyNZlgB39K1wAqdTwdjh8wymDQO3/liv_94e78d0b7516b7d60922f5c5/file.zip";
+    let qs = presigned_put_query(object_path, 1800);
+    let uri = format!("{object_path}?{qs}");
+
+    let (status, headers, body) = anon_request_with_headers(
+        &state,
+        Method::OPTIONS,
+        &uri,
+        &[
+            ("Origin", "http://localhost:3001"),
+            ("Access-Control-Request-Method", "PUT"),
+            (
+                "Access-Control-Request-Headers",
+                "content-type,x-amz-content-sha256",
+            ),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "preflight failed: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(headers.get("access-control-allow-origin").unwrap(), "*");
+    assert_eq!(headers.get("access-control-allow-methods").unwrap(), "PUT");
+    let allow_headers = headers
+        .get("access-control-allow-headers")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_ascii_lowercase();
+    assert!(allow_headers.contains("content-type"));
+    assert!(allow_headers.contains("x-amz-content-sha256"));
+
+    // Actual cross-origin PUT must also expose Allow-Origin.
+    let (status, headers, _) = signed_request(
+        &state,
+        Method::PUT,
+        object_path,
+        BTreeMap::new(),
+        Bytes::from_static(b"zip-bytes"),
+        &[
+            ("content-type", "application/zip"),
+            ("Origin", "http://localhost:3001"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers.get("access-control-allow-origin").unwrap(), "*");
+}
+
+#[tokio::test]
+async fn cors_preflight_on_presigned_put_url_with_explicit_origin() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = common::test_config(tmp.path().to_path_buf());
+    config.default_bucket_name = Some("uploads".into());
+    config.default_bucket_cors = Some(
+        r#"{"rules":[{"allowedOrigins":["http://localhost:3001"],"allowedMethods":["PUT","GET","HEAD"],"allowedHeaders":["*"],"exposeHeaders":["ETag"],"maxAgeSeconds":3000}]}"#
+            .into(),
+    );
+    let state = flash_s3_engine::AppState::new(config).unwrap();
+    state.initialize_default_bucket().await.unwrap();
+
+    let object_path = "/uploads/browser/file.bin";
+    let qs = presigned_put_query(object_path, 1800);
+    let uri = format!("{object_path}?{qs}");
+
+    let (status, headers, body) = anon_request_with_headers(
+        &state,
+        Method::OPTIONS,
+        &uri,
+        &[
+            ("Origin", "http://localhost:3001"),
+            ("Access-Control-Request-Method", "PUT"),
+            ("Access-Control-Request-Headers", "content-type"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "preflight failed: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(
+        headers.get("access-control-allow-origin").unwrap(),
+        "http://localhost:3001"
+    );
+    assert_eq!(headers.get("access-control-allow-methods").unwrap(), "PUT");
+    assert_eq!(headers.get("access-control-max-age").unwrap(), "3000");
+}
+
+#[tokio::test]
+async fn cors_allow_all_env_covers_get_head_post_delete_preflight() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = common::test_config(tmp.path().to_path_buf());
+    config.default_bucket_name = Some("open".into());
+    config.default_bucket_cors_allow_all = true;
+    let state = flash_s3_engine::AppState::new(config).unwrap();
+    state.initialize_default_bucket().await.unwrap();
+
+    for method in ["GET", "HEAD", "POST", "DELETE", "PUT"] {
+        let (status, headers, _) = anon_request_with_headers(
+            &state,
+            Method::OPTIONS,
+            "/open/any/key",
+            &[
+                ("Origin", "http://evil.example:9999"),
+                ("Access-Control-Request-Method", method),
+            ],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "method {method}");
+        assert_eq!(headers.get("access-control-allow-origin").unwrap(), "*");
+        assert_eq!(
+            headers.get("access-control-allow-methods").unwrap(),
+            method
+        );
+    }
+}
+
+#[tokio::test]
+async fn cors_put_get_head_responses_include_allow_origin_with_allow_all() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = common::test_config(tmp.path().to_path_buf());
+    config.default_bucket_name = Some("media".into());
+    config.default_bucket_cors_allow_all = true;
+    let state = flash_s3_engine::AppState::new(config).unwrap();
+    state.initialize_default_bucket().await.unwrap();
+
+    let (status, headers, _) = signed_request(
+        &state,
+        Method::PUT,
+        "/media/obj.bin",
+        BTreeMap::new(),
+        Bytes::from_static(b"data"),
+        &[("Origin", "http://localhost:3001")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers.get("access-control-allow-origin").unwrap(), "*");
+
+    let (status, headers, _) = signed_request(
+        &state,
+        Method::GET,
+        "/media/obj.bin",
+        BTreeMap::new(),
+        Bytes::new(),
+        &[("Origin", "http://localhost:3001")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers.get("access-control-allow-origin").unwrap(), "*");
+
+    let (status, headers, _) = signed_request(
+        &state,
+        Method::HEAD,
+        "/media/obj.bin",
+        BTreeMap::new(),
+        Bytes::new(),
+        &[("Origin", "http://localhost:3001")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers.get("access-control-allow-origin").unwrap(), "*");
+}
+
+#[tokio::test]
+async fn cors_preflight_without_config_still_has_no_allow_origin() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = common::test_config(tmp.path().to_path_buf());
+    config.default_bucket_name = Some("nocors".into());
+    let state = flash_s3_engine::AppState::new(config).unwrap();
+    state.initialize_default_bucket().await.unwrap();
+
+    let object_path = "/nocors/x.bin";
+    let qs = presigned_put_query(object_path, 60);
+    let (status, headers, _) = anon_request_with_headers(
+        &state,
+        Method::OPTIONS,
+        &format!("{object_path}?{qs}"),
+        &[
+            ("Origin", "http://localhost:3001"),
+            ("Access-Control-Request-Method", "PUT"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(headers.get("access-control-allow-origin").is_none());
 }
