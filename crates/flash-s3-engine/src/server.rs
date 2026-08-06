@@ -8,7 +8,7 @@ use crate::auth::{Authorizer, CredentialStore};
 use crate::cache::ObjectCache;
 use crate::config::Config;
 use crate::metrics::Metrics;
-use crate::storage::ObjectStore;
+use crate::storage::{derive_sse_key, ObjectStore};
 
 /// Cloneable handle passed to every HTTP handler via Axum `State`.
 #[derive(Clone)]
@@ -25,6 +25,8 @@ pub struct AppState {
     pub authorizer: Arc<Authorizer>,
     /// Prometheus metrics.
     pub metrics: Metrics,
+    /// Derived SSE-S3 AES-256 key.
+    pub sse_key: [u8; 32],
 }
 
 impl AppState {
@@ -43,6 +45,10 @@ impl AppState {
             root_bypasses: config.root_bypasses_acl,
             auth_required: config.auth_required,
         });
+        let sse_key = derive_sse_key(
+            config.sse_s3_key.as_deref(),
+            config.credentials_key.as_deref(),
+        );
         Ok(Self {
             config: Arc::new(config),
             store,
@@ -50,6 +56,7 @@ impl AppState {
             creds,
             authorizer,
             metrics,
+            sse_key,
         })
     }
 

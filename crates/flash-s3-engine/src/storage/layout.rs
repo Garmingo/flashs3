@@ -63,6 +63,16 @@ pub fn bucket_cors_path(data_dir: &Path, bucket: &str) -> PathBuf {
     bucket_dir(data_dir, bucket).join("cors.xml")
 }
 
+/// Optional bucket tagging JSON file.
+pub fn bucket_tags_path(data_dir: &Path, bucket: &str) -> PathBuf {
+    bucket_dir(data_dir, bucket).join("tags.json")
+}
+
+/// Optional object tagging JSON file (alongside meta/data).
+pub fn object_tags_path(data_dir: &Path, bucket: &str, key: &str) -> PathBuf {
+    current_dir(data_dir, bucket, key).join("tags.json")
+}
+
 /// Multipart staging directory for one upload id.
 pub fn multipart_dir(data_dir: &Path, bucket: &str, upload_id: &str) -> PathBuf {
     bucket_dir(data_dir, bucket)

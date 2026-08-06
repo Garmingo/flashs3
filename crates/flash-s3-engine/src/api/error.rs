@@ -30,11 +30,10 @@ pub fn s3_error_response(err: FlashError, resource: &str, request_id: &str) -> R
 
 /// Escape XML special characters in element text.
 pub fn xml_escape(s: &str) -> String {
+    // Quotes need not be escaped in element character data (only in attributes).
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
 }
 
 /// Axum-friendly error wrapper (used sparingly; most handlers return `FlashError`).

@@ -29,6 +29,10 @@ fn opts(owner: &CanonicalUserId) -> PutObjectOpts {
         content_language: None,
         expires: None,
         checksums: Default::default(),
+        sse_s3: false,
+        sse_nonce: None,
+        plaintext_size: None,
+        etag_override: None,
     }
 }
 

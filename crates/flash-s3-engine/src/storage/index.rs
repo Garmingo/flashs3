@@ -1,8 +1,9 @@
-//! redb-backed key index for fast `ListObjectsV2` without walking the filesystem.
+//! redb-backed key index for fast ListObjects without walking the filesystem.
 //!
 //! Keys are stored as `"{bucket}\0{objectKey}"` so range scans stay per-bucket.
 //! The index is rebuildable from disk if corrupted (rebuild not yet automated).
 
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -28,6 +29,19 @@ pub struct IndexEntry {
     pub last_modified: String,
     /// MIME type.
     pub content_type: String,
+}
+
+/// Result of a ListObjects-style index scan.
+#[derive(Debug, Clone, Default)]
+pub struct ObjectListResult {
+    /// Matching object keys (not rolled into a common prefix).
+    pub contents: Vec<IndexEntry>,
+    /// Unique common prefixes when a delimiter is set.
+    pub common_prefixes: Vec<String>,
+    /// True when more results exist beyond `max_keys` combined slots.
+    pub truncated: bool,
+    /// Continuation key for the next page (last emitted content or prefix).
+    pub next_token: Option<String>,
 }
 
 /// Embedded key/value index (`objects.redb`).
@@ -122,16 +136,15 @@ impl ObjectIndex {
         }
     }
 
-    /// List objects in `bucket` with optional prefix / pagination.
-    ///
-    /// Returns `(entries, truncated)`.
+    /// List objects in `bucket` with optional prefix / delimiter / pagination.
     pub fn list(
         &self,
         bucket: &str,
         prefix: &str,
         start_after: Option<&str>,
+        delimiter: Option<&str>,
         max_keys: usize,
-    ) -> Result<(Vec<IndexEntry>, bool), FlashError> {
+    ) -> Result<ObjectListResult, FlashError> {
         let tx = self
             .db
             .begin_read()
@@ -141,8 +154,13 @@ impl ObjectIndex {
             .map_err(|e| FlashError::Internal(e.to_string()))?;
 
         let prefix_key = format!("{bucket}\0{prefix}");
-        let mut out = Vec::new();
+        let mut contents = Vec::new();
+        let mut common_prefixes = Vec::new();
+        let mut seen_prefixes: BTreeSet<String> = BTreeSet::new();
         let mut truncated = false;
+        let mut next_token = None;
+        let mut slots = 0usize;
+
         let iter = table
             .range(prefix_key.as_str()..)
             .map_err(|e| FlashError::Internal(e.to_string()))?;
@@ -154,35 +172,72 @@ impl ObjectIndex {
                 break;
             }
             let object_key = &key_str[bucket.len() + 1..];
-            if !object_key.starts_with(prefix) {
-                // still might match if prefix empty; if prefix non-empty and doesn't start, stop when past prefix
-                if !prefix.is_empty() && object_key > prefix && !object_key.starts_with(prefix) {
+            if !prefix.is_empty() && !object_key.starts_with(prefix) {
+                if object_key > prefix {
                     break;
                 }
-                if !prefix.is_empty() && !object_key.starts_with(prefix) {
-                    continue;
-                }
+                continue;
             }
             if let Some(sa) = start_after {
                 if object_key <= sa {
                     continue;
                 }
             }
-            if out.len() >= max_keys {
-                truncated = true;
-                break;
-            }
+
             let entry: IndexEntry = serde_json::from_slice(v.value())
                 .map_err(|e| FlashError::Internal(e.to_string()))?;
-            out.push(entry);
+
+            if let Some(delim) = delimiter.filter(|d| !d.is_empty()) {
+                let rest = &object_key[prefix.len()..];
+                if let Some(pos) = rest.find(delim) {
+                    let cp = format!("{}{}", prefix, &rest[..=pos]);
+                    if let Some(sa) = start_after {
+                        if cp.as_str() <= sa {
+                            continue;
+                        }
+                    }
+                    if seen_prefixes.contains(&cp) {
+                        continue;
+                    }
+                    if slots >= max_keys {
+                        truncated = true;
+                        next_token = Some(cp);
+                        break;
+                    }
+                    seen_prefixes.insert(cp.clone());
+                    common_prefixes.push(cp.clone());
+                    slots += 1;
+                    next_token = Some(cp);
+                    continue;
+                }
+            }
+
+            if slots >= max_keys {
+                truncated = true;
+                next_token = Some(object_key.to_string());
+                break;
+            }
+            next_token = Some(object_key.to_string());
+            contents.push(entry);
+            slots += 1;
         }
-        Ok((out, truncated))
+
+        if !truncated {
+            next_token = None;
+        }
+
+        Ok(ObjectListResult {
+            contents,
+            common_prefixes,
+            truncated,
+            next_token,
+        })
     }
 
     /// Count indexed objects in a bucket (used by `DeleteBucket`).
     pub fn count_in_bucket(&self, bucket: &str) -> Result<usize, FlashError> {
-        let (entries, _) = self.list(bucket, "", None, usize::MAX)?;
-        Ok(entries.len())
+        let result = self.list(bucket, "", None, None, usize::MAX)?;
+        Ok(result.contents.len())
     }
 }
 

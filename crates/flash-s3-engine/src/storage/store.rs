@@ -81,6 +81,12 @@ pub struct ObjectMeta {
     /// Validated object checksums, keyed by the S3 response header name.
     #[serde(default)]
     pub checksums: std::collections::HashMap<String, String>,
+    /// When true, object body on disk is SSE-S3 (AES-256-GCM) ciphertext.
+    #[serde(default)]
+    pub sse_s3: bool,
+    /// Base64 nonce used for SSE-S3 GCM (12 bytes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sse_nonce: Option<String>,
 }
 
 /// Options for [`ObjectStore::put_object`] / copy / stream puts.
@@ -108,6 +114,14 @@ pub struct PutObjectOpts {
     pub expires: Option<String>,
     /// Validated request checksum values.
     pub checksums: std::collections::HashMap<String, String>,
+    /// Request SSE-S3 (`x-amz-server-side-encryption: AES256`).
+    pub sse_s3: bool,
+    /// Base64 GCM nonce when `sse_s3` (body is already ciphertext).
+    pub sse_nonce: Option<String>,
+    /// Logical plaintext size when body is ciphertext.
+    pub plaintext_size: Option<u64>,
+    /// Optional ETag override (e.g. MD5 of plaintext).
+    pub etag_override: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -379,6 +393,8 @@ impl ObjectStore {
     /// Write-through put: atomic disk write, then index update.
     ///
     /// Callers decide whether to insert into the RAM cache afterwards.
+    /// When `opts.sse_s3` is set, `body` must already be ciphertext and
+    /// `opts.sse_nonce` / `opts.plaintext_size` must be populated by the caller.
     pub async fn put_object(
         &self,
         bucket: &str,
@@ -406,7 +422,11 @@ impl ObjectStore {
         let data_path = layout::data_path(&self.data_dir, bucket, key.as_str());
         tokio::fs::rename(&tmp, &data_path).await.map_err(io_err)?;
 
-        let etag = md5_etag(&body);
+        let logical_size = opts.plaintext_size.unwrap_or(body.len() as u64);
+        let etag = opts
+            .etag_override
+            .clone()
+            .unwrap_or_else(|| md5_etag(&body));
         let acl = opts.acl.unwrap_or_else(|| {
             AccessControlPolicy::from_canned(
                 opts.owner.clone(),
@@ -416,7 +436,7 @@ impl ObjectStore {
         });
         let meta = ObjectMeta {
             key: key.as_str().to_string(),
-            size: body.len() as u64,
+            size: logical_size,
             etag: etag.clone(),
             content_type: opts
                 .content_type
@@ -432,6 +452,8 @@ impl ObjectStore {
             acl,
             user_meta: opts.user_meta,
             checksums: opts.checksums,
+            sse_s3: opts.sse_s3,
+            sse_nonce: opts.sse_nonce,
         };
         atomic_write_json(&layout::meta_path(&self.data_dir, bucket, key.as_str()), &meta)
             .await?;
@@ -445,9 +467,7 @@ impl ObjectStore {
             content_type: meta.content_type.clone(),
         })?;
 
-        self.metrics
-            .disk_write_bytes
-            .inc_by(body.len() as u64);
+        self.metrics.disk_write_bytes.inc_by(body.len() as u64);
         self.metrics
             .disk_op_duration
             .with_label_values(&["write"])
@@ -526,6 +546,26 @@ impl ObjectStore {
             acl,
             user_meta: opts.user_meta,
             checksums: opts.checksums,
+            sse_s3: opts.sse_s3,
+            sse_nonce: opts.sse_nonce.clone(),
+        };
+        // If SSE requested on streaming put, encrypt the on-disk body in a second pass.
+        let meta = if opts.sse_s3 && opts.sse_nonce.is_none() {
+            return Err(FlashError::InvalidRequest(
+                "streaming SSE-S3 requires pre-encrypted body".into(),
+            ));
+        } else {
+            meta
+        };
+        let meta = {
+            let mut meta = meta;
+            if let Some(sz) = opts.plaintext_size {
+                meta.size = sz;
+            }
+            if let Some(etag) = opts.etag_override {
+                meta.etag = etag;
+            }
+            meta
         };
         atomic_write_json(&layout::meta_path(&self.data_dir, bucket, key.as_str()), &meta)
             .await?;
@@ -641,14 +681,17 @@ impl ObjectStore {
         bucket: &str,
         prefix: &str,
         start_after: Option<&str>,
+        delimiter: Option<&str>,
         max_keys: usize,
-    ) -> Result<(Vec<IndexEntry>, bool), FlashError> {
+    ) -> Result<crate::storage::ObjectListResult, FlashError> {
         let start = Instant::now();
         // ensure bucket exists synchronously via path check
         if !layout::bucket_json_path(&self.data_dir, bucket).exists() {
             return Err(FlashError::NoSuchBucket);
         }
-        let res = self.index.list(bucket, prefix, start_after, max_keys)?;
+        let res = self
+            .index
+            .list(bucket, prefix, start_after, delimiter, max_keys)?;
         self.metrics
             .disk_op_duration
             .with_label_values(&["list"])
@@ -925,6 +968,8 @@ impl ObjectStore {
             acl,
             user_meta: Default::default(),
             checksums: Default::default(),
+            sse_s3: false,
+            sse_nonce: None,
         };
         atomic_write_json(&layout::meta_path(&self.data_dir, bucket, key.as_str()), &obj)
             .await?;
@@ -970,6 +1015,232 @@ impl ObjectStore {
             .map(|p| (p.part_number, p.etag, p.size))
             .collect();
         Ok((meta.key, parts))
+    }
+
+    // --- Tagging -------------------------------------------------------------
+
+    pub async fn put_bucket_tags(
+        &self,
+        bucket: &str,
+        tags: &[(String, String)],
+    ) -> Result<(), FlashError> {
+        let _ = self.get_bucket(bucket).await?;
+        atomic_write_json(&layout::bucket_tags_path(&self.data_dir, bucket), &tags).await
+    }
+
+    pub async fn get_bucket_tags(&self, bucket: &str) -> Result<Vec<(String, String)>, FlashError> {
+        let _ = self.get_bucket(bucket).await?;
+        let path = layout::bucket_tags_path(&self.data_dir, bucket);
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        read_json(&path).await
+    }
+
+    pub async fn delete_bucket_tags(&self, bucket: &str) -> Result<(), FlashError> {
+        let _ = self.get_bucket(bucket).await?;
+        let path = layout::bucket_tags_path(&self.data_dir, bucket);
+        if path.exists() {
+            tokio::fs::remove_file(path).await.map_err(io_err)?;
+        }
+        Ok(())
+    }
+
+    pub async fn put_object_tags(
+        &self,
+        bucket: &str,
+        key: &ObjectKey,
+        tags: &[(String, String)],
+    ) -> Result<(), FlashError> {
+        let _ = self.get_object_meta(bucket, key).await?;
+        atomic_write_json(
+            &layout::object_tags_path(&self.data_dir, bucket, key.as_str()),
+            &tags,
+        )
+        .await
+    }
+
+    pub async fn get_object_tags(
+        &self,
+        bucket: &str,
+        key: &ObjectKey,
+    ) -> Result<Vec<(String, String)>, FlashError> {
+        let _ = self.get_object_meta(bucket, key).await?;
+        let path = layout::object_tags_path(&self.data_dir, bucket, key.as_str());
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        read_json(&path).await
+    }
+
+    pub async fn delete_object_tags(
+        &self,
+        bucket: &str,
+        key: &ObjectKey,
+    ) -> Result<(), FlashError> {
+        let _ = self.get_object_meta(bucket, key).await?;
+        let path = layout::object_tags_path(&self.data_dir, bucket, key.as_str());
+        if path.exists() {
+            tokio::fs::remove_file(path).await.map_err(io_err)?;
+        }
+        Ok(())
+    }
+
+    /// List in-progress multipart uploads for a bucket.
+    pub async fn list_multipart_uploads(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        key_marker: Option<&str>,
+        upload_id_marker: Option<&str>,
+        delimiter: Option<&str>,
+        max_uploads: usize,
+    ) -> Result<
+        (
+            Vec<(String, String, String)>,
+            Vec<String>,
+            bool,
+            Option<String>,
+            Option<String>,
+        ),
+        FlashError,
+    > {
+        let _ = self.get_bucket(bucket).await?;
+        let root = layout::bucket_dir(&self.data_dir, bucket).join("multipart");
+        let mut uploads = Vec::new();
+        if root.exists() {
+            let mut rd = tokio::fs::read_dir(&root).await.map_err(io_err)?;
+            while let Some(entry) = rd.next_entry().await.map_err(io_err)? {
+                if !entry.file_type().await.map_err(io_err)?.is_dir() {
+                    continue;
+                }
+                let _upload_id = entry.file_name().to_string_lossy().to_string();
+                let meta_path = entry.path().join("meta.json");
+                if !meta_path.exists() {
+                    continue;
+                }
+                let meta: MultipartMeta = read_json(&meta_path).await?;
+                if !meta.key.starts_with(prefix) {
+                    continue;
+                }
+                uploads.push((meta.key, meta.upload_id, meta.initiated));
+            }
+        }
+        uploads.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+
+        let mut filtered = Vec::new();
+        for (key, upload_id, initiated) in uploads {
+            if let Some(km) = key_marker {
+                if key.as_str() < km {
+                    continue;
+                }
+                if key.as_str() == km {
+                    if let Some(um) = upload_id_marker {
+                        if upload_id.as_str() <= um {
+                            continue;
+                        }
+                    }
+                }
+            }
+            filtered.push((key, upload_id, initiated));
+        }
+
+        let mut out = Vec::new();
+        let mut common_prefixes = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        let mut truncated = false;
+        let mut next_key = None;
+        let mut next_upload = None;
+        let mut slots = 0usize;
+
+        for (key, upload_id, initiated) in filtered {
+            if let Some(delim) = delimiter.filter(|d| !d.is_empty()) {
+                let rest = &key[prefix.len()..];
+                if let Some(pos) = rest.find(delim) {
+                    let cp = format!("{}{}", prefix, &rest[..=pos]);
+                    if !seen.insert(cp.clone()) {
+                        continue;
+                    }
+                    if slots >= max_uploads {
+                        truncated = true;
+                        next_key = Some(key);
+                        next_upload = Some(upload_id);
+                        break;
+                    }
+                    common_prefixes.push(cp);
+                    slots += 1;
+                    continue;
+                }
+            }
+            if slots >= max_uploads {
+                truncated = true;
+                next_key = Some(key);
+                next_upload = Some(upload_id);
+                break;
+            }
+            next_key = Some(key.clone());
+            next_upload = Some(upload_id.clone());
+            out.push((key, upload_id, initiated));
+            slots += 1;
+        }
+        if !truncated {
+            next_key = None;
+            next_upload = None;
+        }
+        Ok((out, common_prefixes, truncated, next_key, next_upload))
+    }
+
+    /// Copy a byte range from a source object into a multipart part.
+    pub async fn upload_part_copy(
+        &self,
+        bucket: &str,
+        upload_id: &str,
+        part_number: i32,
+        src_bucket: &str,
+        src_key: &ObjectKey,
+        range: Option<(u64, u64)>,
+        sse_key: &[u8; 32],
+    ) -> Result<(String, String), FlashError> {
+        let (meta, mut data) = self.read_object_bytes(src_bucket, src_key).await?;
+        if meta.sse_s3 {
+            let nonce = meta
+                .sse_nonce
+                .as_deref()
+                .ok_or_else(|| FlashError::Internal("missing sse nonce".into()))?;
+            data = Bytes::from(crate::storage::sse_decrypt(sse_key, nonce, &data)?);
+        }
+        let slice = if let Some((start, end)) = range {
+            if start > end || end >= data.len() as u64 {
+                return Err(FlashError::InvalidRequest("invalid copy source range".into()));
+            }
+            data.slice(start as usize..=end as usize)
+        } else {
+            data
+        };
+        let etag = self
+            .upload_part(bucket, upload_id, part_number, slice)
+            .await?;
+        Ok((etag, meta.last_modified))
+    }
+
+    /// Read object bytes and optionally decrypt SSE-S3.
+    pub async fn read_object_plaintext(
+        &self,
+        bucket: &str,
+        key: &ObjectKey,
+        sse_key: &[u8; 32],
+    ) -> Result<(ObjectMeta, Bytes), FlashError> {
+        let (meta, data) = self.read_object_bytes(bucket, key).await?;
+        if meta.sse_s3 {
+            let nonce = meta
+                .sse_nonce
+                .as_deref()
+                .ok_or_else(|| FlashError::Internal("missing sse nonce".into()))?;
+            let plain = crate::storage::sse_decrypt(sse_key, nonce, &data)?;
+            Ok((meta, Bytes::from(plain)))
+        } else {
+            Ok((meta, data))
+        }
     }
 }
 

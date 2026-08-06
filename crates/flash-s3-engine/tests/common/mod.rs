@@ -43,6 +43,8 @@ pub fn test_config(data_dir: PathBuf) -> Config {
         default_bucket_cors: None,
         default_bucket_cors_allow_all: false,
         root_bypasses_acl: true,
+        sse_s3_key: None,
+        virtual_host_base: None,
     }
 }
 

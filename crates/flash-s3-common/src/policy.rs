@@ -148,6 +148,19 @@ pub fn wildcard_match(pattern: &str, value: &str) -> bool {
     p == pattern.len()
 }
 
+/// Optional context for policy condition evaluation.
+#[derive(Debug, Default)]
+pub struct PolicyConditionCtx<'a> {
+    /// Caller access key (maps to `aws:username`).
+    pub access_key: Option<&'a str>,
+    /// `s3:prefix` condition key value.
+    pub s3_prefix: Option<&'a str>,
+    /// `s3:delimiter` condition key value.
+    pub s3_delimiter: Option<&'a str>,
+    /// `s3:x-amz-acl` condition key value.
+    pub s3_x_amz_acl: Option<&'a str>,
+}
+
 impl BucketPolicy {
     /// Parse policy JSON, tolerating lowercase field names.
     pub fn parse_json(raw: &str) -> Result<Self, crate::FlashError> {
@@ -171,6 +184,7 @@ impl BucketPolicy {
         action: &str,
         resource: &str,
         access_key: Option<&str>,
+        condition_ctx: Option<&PolicyConditionCtx<'_>>,
     ) -> Option<bool> {
         let mut denied = false;
         let mut allowed = false;
@@ -184,6 +198,11 @@ impl BucketPolicy {
             if !stmt.resource.matches_any(resource) {
                 continue;
             }
+            if let Some(cond) = &stmt.condition {
+                if !condition_matches(cond, condition_ctx) {
+                    continue;
+                }
+            }
             match stmt.effect {
                 PolicyEffect::Deny => denied = true,
                 PolicyEffect::Allow => allowed = true,
@@ -196,6 +215,75 @@ impl BucketPolicy {
         } else {
             None
         }
+    }
+}
+
+fn condition_matches(condition: &Value, ctx: Option<&PolicyConditionCtx<'_>>) -> bool {
+    let Value::Object(operators) = condition else {
+        return true;
+    };
+    let ctx_default = PolicyConditionCtx::default();
+    let ctx = ctx.unwrap_or(&ctx_default);
+    for (op_name, keys_obj) in operators {
+        let Value::Object(keys) = keys_obj else {
+            return false;
+        };
+        for (key, expected) in keys {
+            let actual = resolve_condition_key(key, ctx);
+            if !eval_condition_op(op_name, actual.as_deref(), expected) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn resolve_condition_key<'a>(key: &str, ctx: &'a PolicyConditionCtx<'a>) -> Option<&'a str> {
+    match key {
+        "s3:prefix" => ctx.s3_prefix,
+        "s3:delimiter" => ctx.s3_delimiter,
+        "s3:x-amz-acl" => ctx.s3_x_amz_acl,
+        "aws:username" => ctx.access_key,
+        _ => None,
+    }
+}
+
+fn eval_condition_op(op: &str, actual: Option<&str>, expected: &Value) -> bool {
+    let expected_values = match expected {
+        Value::String(s) => vec![s.as_str()],
+        Value::Array(arr) => arr.iter().filter_map(|v| v.as_str()).collect(),
+        _ => return false,
+    };
+
+    match op {
+        "StringEquals" => {
+            let Some(actual) = actual else { return false };
+            expected_values.iter().any(|e| *e == actual)
+        }
+        "StringNotEquals" => {
+            let Some(actual) = actual else { return true };
+            expected_values.iter().all(|e| *e != actual)
+        }
+        "StringLike" => {
+            let Some(actual) = actual else { return false };
+            expected_values.iter().any(|e| wildcard_match(e, actual))
+        }
+        "StringNotLike" => {
+            let Some(actual) = actual else { return true };
+            expected_values.iter().all(|e| !wildcard_match(e, actual))
+        }
+        "Null" => {
+            let check_null = expected_values
+                .first()
+                .map(|v| v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            if check_null {
+                actual.is_none()
+            } else {
+                actual.is_some()
+            }
+        }
+        _ => false,
     }
 }
 
@@ -260,11 +348,11 @@ mod tests {
         }"#;
         let p = BucketPolicy::parse_json(raw).unwrap();
         assert_eq!(
-            p.evaluate("s3:GetObject", "arn:aws:s3:::demo/a.txt", None),
+            p.evaluate("s3:GetObject", "arn:aws:s3:::demo/a.txt", None, None),
             Some(true)
         );
         assert_eq!(
-            p.evaluate("s3:PutObject", "arn:aws:s3:::demo/a.txt", None),
+            p.evaluate("s3:PutObject", "arn:aws:s3:::demo/a.txt", None, None),
             None
         );
     }
@@ -289,11 +377,11 @@ mod tests {
         }"#;
         let p = BucketPolicy::parse_json(raw).unwrap();
         assert_eq!(
-            p.evaluate("s3:DeleteObject", "arn:aws:s3:::demo/x", Some("alice")),
+            p.evaluate("s3:DeleteObject", "arn:aws:s3:::demo/x", Some("alice"), None),
             Some(false)
         );
         assert_eq!(
-            p.evaluate("s3:GetObject", "arn:aws:s3:::demo/x", Some("alice")),
+            p.evaluate("s3:GetObject", "arn:aws:s3:::demo/x", Some("alice"), None),
             Some(true)
         );
     }
@@ -311,6 +399,6 @@ mod tests {
     fn lowercase_json_normalized() {
         let raw = r#"{"version":"2012-10-17","statement":[{"effect":"allow","principal":"*","action":"s3:GetObject","resource":"arn:aws:s3:::b/*"}]}"#;
         let p = BucketPolicy::parse_json(raw).unwrap();
-        assert_eq!(p.evaluate("s3:GetObject", "arn:aws:s3:::b/k", None), Some(true));
+        assert_eq!(p.evaluate("s3:GetObject", "arn:aws:s3:::b/k", None, None), Some(true));
     }
 }
