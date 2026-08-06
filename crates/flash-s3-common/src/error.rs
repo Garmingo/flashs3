@@ -77,6 +77,9 @@ pub enum FlashError {
     /// Generic client error with detail message.
     #[error("InvalidRequest: {0}")]
     InvalidRequest(String),
+    /// Invalid argument (e.g. non-numeric `max-keys`, incompatible query params).
+    #[error("InvalidArgument: {0}")]
+    InvalidArgument(String),
     /// Unexpected internal failure (I/O, corrupt meta, …).
     #[error("InternalError: {0}")]
     Internal(String),
@@ -112,6 +115,7 @@ impl FlashError {
             Self::PreconditionFailed => "PreconditionFailed",
             Self::ConditionalRequestConflict => "ConditionalRequestConflict",
             Self::InvalidRequest(_) => "InvalidRequest",
+            Self::InvalidArgument(_) => "InvalidArgument",
             Self::Internal(_) => "InternalError",
             Self::NotImplemented(_) => "NotImplemented",
         }

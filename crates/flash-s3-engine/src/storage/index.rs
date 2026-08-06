@@ -137,6 +137,10 @@ impl ObjectIndex {
     }
 
     /// List objects in `bucket` with optional prefix / delimiter / pagination.
+    ///
+    /// When truncated, [`ObjectListResult::next_token`] is the **last emitted**
+    /// key or common prefix (S3 Marker / ContinuationToken semantics: exclusive
+    /// start-after for the next page).
     pub fn list(
         &self,
         bucket: &str,
@@ -145,6 +149,11 @@ impl ObjectIndex {
         delimiter: Option<&str>,
         max_keys: usize,
     ) -> Result<ObjectListResult, FlashError> {
+        // AWS: MaxKeys=0 → empty listing, IsTruncated=false.
+        if max_keys == 0 {
+            return Ok(ObjectListResult::default());
+        }
+
         let tx = self
             .db
             .begin_read()
@@ -160,6 +169,8 @@ impl ObjectIndex {
         let mut truncated = false;
         let mut next_token = None;
         let mut slots = 0usize;
+        // Empty markers mean "start from the beginning".
+        let start_after = start_after.filter(|s| !s.is_empty());
 
         let iter = table
             .range(prefix_key.as_str()..)
@@ -200,8 +211,8 @@ impl ObjectIndex {
                         continue;
                     }
                     if slots >= max_keys {
+                        // Keep next_token as last emitted key/prefix.
                         truncated = true;
-                        next_token = Some(cp);
                         break;
                     }
                     seen_prefixes.insert(cp.clone());
@@ -214,7 +225,6 @@ impl ObjectIndex {
 
             if slots >= max_keys {
                 truncated = true;
-                next_token = Some(object_key.to_string());
                 break;
             }
             next_token = Some(object_key.to_string());

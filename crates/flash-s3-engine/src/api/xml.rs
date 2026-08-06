@@ -41,18 +41,25 @@ pub fn list_objects_v2_xml(
     next_token: Option<&str>,
     start_after: Option<&str>,
     continuation_token: Option<&str>,
+    encoding_type: Option<&str>,
+    owner: Option<(&str, &str)>,
 ) -> String {
+    let encode = encoding_type.map(|t| t.eq_ignore_ascii_case("url")).unwrap_or(false);
+    let enc = |s: &str| if encode { s3_url_encode(s) } else { s.to_string() };
     let key_count = contents.len() + common_prefixes.len();
     let mut body = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?><ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>{}</Name><Prefix>{}</Prefix><MaxKeys>{}</MaxKeys><IsTruncated>{}</IsTruncated><KeyCount>{}</KeyCount>"#,
         xml_escape(bucket),
-        xml_escape(prefix),
+        xml_escape(&enc(prefix)),
         max_keys,
         truncated,
         key_count
     );
-    if let Some(d) = delimiter {
-        body.push_str(&format!("<Delimiter>{}</Delimiter>", xml_escape(d)));
+    if let Some(d) = delimiter.filter(|d| !d.is_empty()) {
+        body.push_str(&format!("<Delimiter>{}</Delimiter>", xml_escape(&enc(d))));
+    }
+    if encode {
+        body.push_str("<EncodingType>url</EncodingType>");
     }
     if let Some(t) = continuation_token {
         body.push_str(&format!(
@@ -69,7 +76,7 @@ pub fn list_objects_v2_xml(
     if let Some(s) = start_after {
         body.push_str(&format!("<StartAfter>{}</StartAfter>", xml_escape(s)));
     }
-    append_contents_and_prefixes(&mut body, contents, common_prefixes);
+    append_contents_and_prefixes(&mut body, contents, common_prefixes, encode, owner);
     body.push_str("</ListBucketResult>");
     body
 }
@@ -85,24 +92,31 @@ pub fn list_objects_v1_xml(
     contents: &[IndexEntry],
     common_prefixes: &[String],
     next_marker: Option<&str>,
+    encoding_type: Option<&str>,
+    owner: Option<(&str, &str)>,
 ) -> String {
+    let encode = encoding_type.map(|t| t.eq_ignore_ascii_case("url")).unwrap_or(false);
+    let enc = |s: &str| if encode { s3_url_encode(s) } else { s.to_string() };
     let mut body = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?><ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>{}</Name><Prefix>{}</Prefix><Marker>{}</Marker><MaxKeys>{}</MaxKeys><IsTruncated>{}</IsTruncated>"#,
         xml_escape(bucket),
-        xml_escape(prefix),
+        xml_escape(&enc(prefix)),
         xml_escape(marker.unwrap_or("")),
         max_keys,
         truncated
     );
-    if let Some(d) = delimiter {
-        body.push_str(&format!("<Delimiter>{}</Delimiter>", xml_escape(d)));
+    if let Some(d) = delimiter.filter(|d| !d.is_empty()) {
+        body.push_str(&format!("<Delimiter>{}</Delimiter>", xml_escape(&enc(d))));
+    }
+    if encode {
+        body.push_str("<EncodingType>url</EncodingType>");
     }
     if truncated {
         if let Some(m) = next_marker {
             body.push_str(&format!("<NextMarker>{}</NextMarker>", xml_escape(m)));
         }
     }
-    append_contents_and_prefixes(&mut body, contents, common_prefixes);
+    append_contents_and_prefixes(&mut body, contents, common_prefixes, encode, owner);
     body.push_str("</ListBucketResult>");
     body
 }
@@ -166,24 +180,49 @@ pub fn list_object_versions_xml(
     body
 }
 
+/// URL-encode for `encoding-type=url` (keep `/` unencoded, like AWS S3).
+pub fn s3_url_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                out.push(b as char);
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 fn append_contents_and_prefixes(
     body: &mut String,
     contents: &[IndexEntry],
     common_prefixes: &[String],
+    encode: bool,
+    owner: Option<(&str, &str)>,
 ) {
+    let enc = |s: &str| if encode { s3_url_encode(s) } else { s.to_string() };
     for c in contents {
         body.push_str(&format!(
-            "<Contents><Key>{}</Key><LastModified>{}</LastModified><ETag>{}</ETag><Size>{}</Size><StorageClass>STANDARD</StorageClass></Contents>",
-            xml_escape(&c.key),
+            "<Contents><Key>{}</Key><LastModified>{}</LastModified><ETag>{}</ETag><Size>{}</Size><StorageClass>STANDARD</StorageClass>",
+            xml_escape(&enc(&c.key)),
             xml_escape(&c.last_modified),
             xml_escape(&c.etag),
             c.size
         ));
+        if let Some((oid, oname)) = owner {
+            body.push_str(&format!(
+                "<Owner><ID>{}</ID><DisplayName>{}</DisplayName></Owner>",
+                xml_escape(oid),
+                xml_escape(oname)
+            ));
+        }
+        body.push_str("</Contents>");
     }
     for p in common_prefixes {
         body.push_str(&format!(
             "<CommonPrefixes><Prefix>{}</Prefix></CommonPrefixes>",
-            xml_escape(p)
+            xml_escape(&enc(p))
         ));
     }
 }

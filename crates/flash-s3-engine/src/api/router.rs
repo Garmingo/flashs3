@@ -325,9 +325,7 @@ fn resolve_bucket_key(
             let host = host_val.split(':').next().unwrap_or(host_val);
             if let Some(bucket) = host.strip_suffix(&format!(".{}", base)) {
                 if !bucket.is_empty() {
-                    let key_raw = path
-                        .map(|p| p.split('/').filter(|s| !s.is_empty()).collect::<Vec<_>>().join("/"))
-                        .filter(|s| !s.is_empty());
+                    let key_raw = path.and_then(object_key_from_path_tail);
                     return (Some(bucket.to_string()), key_raw);
                 }
             }
@@ -344,13 +342,31 @@ fn resolve_bucket_key(
                 let key = if segments.is_empty() {
                     None
                 } else {
-                    Some(segments.join("/"))
+                    // Preserve trailing slash (`foo/` is a distinct S3 object key).
+                    let mut key = segments.join("/");
+                    if p.ends_with('/') {
+                        key.push('/');
+                    }
+                    Some(key)
                 };
                 (Some(bucket), key)
             }
         }
         None => (None, None),
     }
+}
+
+/// Object key from a virtual-hosted path tail (no bucket segment).
+fn object_key_from_path_tail(p: &str) -> Option<String> {
+    let segments: Vec<&str> = p.split('/').filter(|s| !s.is_empty()).collect();
+    if segments.is_empty() {
+        return None;
+    }
+    let mut key = segments.join("/");
+    if p.ends_with('/') {
+        key.push('/');
+    }
+    Some(key)
 }
 
 /// Check If-None-Match / If-Match preconditions for PutObject.
@@ -730,12 +746,16 @@ async fn bucket_ops(
             let policy = state.store.load_policy(bucket).await?;
             let prefix = query.get("prefix").cloned().unwrap_or_default();
             let delimiter = query.get("delimiter").map(|s| s.as_str());
-            let max_keys: usize = query
-                .get("max-keys")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(1000)
-                .min(1000);
+            let encoding_type = query.get("encoding-type").map(|s| s.as_str());
+            let max_keys = parse_list_max_keys(query.get("max-keys").map(|s| s.as_str()))?;
             let is_v2 = query.get("list-type").map(|s| s == "2").unwrap_or(false);
+            if query.contains_key("allow-unordered")
+                && delimiter.map(|d| !d.is_empty()).unwrap_or(false)
+            {
+                return Err(FlashError::InvalidArgument(
+                    "Unordered listing not supported with delimiter".into(),
+                ));
+            }
             let condition_ctx = PolicyConditionCtx {
                 access_key: ctx.access_key(),
                 s3_prefix: Some(&prefix),
@@ -752,16 +772,30 @@ async fn bucket_ops(
             )?;
 
             let (start_after, continuation_token, marker) = if is_v2 {
-                let ct = query.get("continuation-token").map(|s| s.as_str());
-                let sa = query.get("start-after").map(|s| s.as_str());
+                let ct = query
+                    .get("continuation-token")
+                    .map(|s| s.as_str())
+                    .filter(|s| !s.is_empty());
+                let sa = query
+                    .get("start-after")
+                    .map(|s| s.as_str())
+                    .filter(|s| !s.is_empty());
                 let effective = ct.or(sa);
-                (effective, ct, None)
+                (effective, query.get("continuation-token").map(|s| s.as_str()), None)
             } else {
                 let m = query.get("marker").map(|s| s.as_str());
-                (m, None, m)
+                (m.filter(|s| !s.is_empty()), None, m)
             };
 
             let result = state.store.list_objects(bucket, &prefix, start_after, delimiter, max_keys)?;
+            let owner_pair = (info.owner.as_str(), info.owner_display_name.as_str());
+            // V1 always returns Owner; V2 only when fetch-owner is true.
+            let include_owner = !is_v2
+                || query
+                    .get("fetch-owner")
+                    .map(|s| s.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false);
+            let owner = include_owner.then_some(owner_pair);
 
             let body = if is_v2 {
                 xml::list_objects_v2_xml(
@@ -775,6 +809,8 @@ async fn bucket_ops(
                     result.next_token.as_deref(),
                     query.get("start-after").map(|s| s.as_str()),
                     continuation_token,
+                    encoding_type,
+                    owner,
                 )
             } else {
                 xml::list_objects_v1_xml(
@@ -787,6 +823,8 @@ async fn bucket_ops(
                     &result.contents,
                     &result.common_prefixes,
                     result.next_token.as_deref(),
+                    encoding_type,
+                    owner,
                 )
             };
             let label = if is_v2 { "ListObjectsV2" } else { "ListObjects" };
@@ -1898,7 +1936,9 @@ fn object_response_with_status(
         }
     }
     for (name, value) in &meta.user_meta {
-        builder = builder.header(format!("x-amz-meta-{name}"), value);
+        if let Some(hv) = meta_to_header_value(value) {
+            builder = builder.header(format!("x-amz-meta-{name}"), hv);
+        }
     }
     for (name, value) in &meta.checksums {
         builder = builder.header(name, value);
@@ -2166,14 +2206,55 @@ fn parse_query(q: &str) -> BTreeMap<String, String> {
     map
 }
 
+fn parse_list_max_keys(raw: Option<&str>) -> Result<usize, FlashError> {
+    match raw {
+        None | Some("") => Ok(1000),
+        Some(s) => {
+            let n: i64 = s.parse().map_err(|_| {
+                FlashError::InvalidArgument(format!("Provided max-keys not an integer or within integer range: {s}"))
+            })?;
+            if n < 0 {
+                return Err(FlashError::InvalidArgument(format!(
+                    "Argument max-keys must be an integer between 0 and 2147483647"
+                )));
+            }
+            Ok((n as usize).min(1000))
+        }
+    }
+}
+
+/// Read a header value as a string, including opaque / ISO-8859-1 bytes.
+///
+/// `HeaderValue::to_str` only accepts visible ASCII. Prefer UTF-8 (botocore may
+/// send Unicode metadata as UTF-8 on the wire); fall back to ISO-8859-1.
+fn header_value_string(value: &HeaderValue) -> String {
+    match std::str::from_utf8(value.as_bytes()) {
+        Ok(s) => s.to_string(),
+        Err(_) => value.as_bytes().iter().map(|&b| b as char).collect(),
+    }
+}
+
+/// Encode a stored metadata string back to an HTTP header value.
+///
+/// Emit ISO-8859-1 when all codepoints fit in a byte so Latin-1 clients
+/// (botocore metadata parsing) round-trip Unicode like `é` correctly.
+fn meta_to_header_value(value: &str) -> Option<HeaderValue> {
+    if value.is_ascii() {
+        return HeaderValue::from_str(value).ok();
+    }
+    if value.chars().all(|c| u32::from(c) <= 0xFF) {
+        let bytes: Vec<u8> = value.chars().map(|c| u32::from(c) as u8).collect();
+        return HeaderValue::from_bytes(&bytes).ok();
+    }
+    HeaderValue::from_bytes(value.as_bytes()).ok()
+}
+
 fn extract_user_meta(headers: &HeaderMap) -> std::collections::HashMap<String, String> {
     let mut m = std::collections::HashMap::new();
     for (k, v) in headers.iter() {
         let name = k.as_str();
         if let Some(rest) = name.strip_prefix("x-amz-meta-") {
-            if let Ok(val) = v.to_str() {
-                m.insert(rest.to_string(), val.to_string());
-            }
+            m.insert(rest.to_string(), header_value_string(v));
         }
     }
     m

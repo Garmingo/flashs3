@@ -86,7 +86,152 @@ async fn list_objects_v1_uses_marker() {
     let text = String::from_utf8_lossy(&body);
     assert!(text.contains("<Key>b</Key>"));
     assert!(text.contains("<IsTruncated>true</IsTruncated>"));
-    assert!(text.contains("<NextMarker>"));
+    // NextMarker must be the last returned key, not the first excluded one.
+    assert!(text.contains("<NextMarker>b</NextMarker>"));
+    assert!(text.contains("<Owner>"));
+}
+
+#[tokio::test]
+async fn list_objects_encoding_type_url_and_max_keys_zero() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = app_state(&tmp);
+    ensure_bucket(&state, "encurl").await;
+    put_object(&state, "/encurl/asdf+b", b"1").await;
+    put_object(&state, "/encurl/foo+1/bar", b"2").await;
+    put_object(&state, "/encurl/quux%20ab/thud", b"3").await;
+
+    let mut q = BTreeMap::new();
+    q.insert("list-type".into(), "2".into());
+    q.insert("delimiter".into(), "/".into());
+    q.insert("encoding-type".into(), "url".into());
+    let (status, _, body) =
+        signed_request(&state, Method::GET, "/encurl", q, Bytes::new(), &[]).await;
+    assert_eq!(status, StatusCode::OK);
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("<Key>asdf%2Bb</Key>"));
+    assert!(text.contains("<Prefix>foo%2B1/</Prefix>"));
+    assert!(text.contains("<Prefix>quux%20ab/</Prefix>"));
+    assert!(text.contains("<EncodingType>url</EncodingType>"));
+
+    let mut q0 = BTreeMap::new();
+    q0.insert("max-keys".into(), "0".into());
+    let (status, _, body) =
+        signed_request(&state, Method::GET, "/encurl", q0, Bytes::new(), &[]).await;
+    assert_eq!(status, StatusCode::OK);
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("<IsTruncated>false</IsTruncated>"));
+    assert!(text.contains("<MaxKeys>0</MaxKeys>"));
+    assert!(!text.contains("<Contents>"));
+}
+
+#[tokio::test]
+async fn list_objects_empty_delimiter_omitted_and_invalid_max_keys() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = app_state(&tmp);
+    ensure_bucket(&state, "delimempty").await;
+    put_object(&state, "/delimempty/a", b"1").await;
+
+    let mut q = BTreeMap::new();
+    q.insert("delimiter".into(), "".into());
+    let (status, _, body) =
+        signed_request(&state, Method::GET, "/delimempty", q, Bytes::new(), &[]).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!String::from_utf8_lossy(&body).contains("<Delimiter>"));
+
+    let mut qbad = BTreeMap::new();
+    qbad.insert("max-keys".into(), "blah".into());
+    let (status, _, body) =
+        signed_request(&state, Method::GET, "/delimempty", qbad, Bytes::new(), &[]).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(String::from_utf8_lossy(&body).contains("InvalidArgument"));
+}
+
+#[tokio::test]
+async fn list_objects_delimiter_prefix_pagination_next_marker() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = app_state(&tmp);
+    ensure_bucket(&state, "delpref").await;
+    for key in ["asdf", "boo/bar", "boo/baz/xyzzy", "cquux/thud", "cquux/bla"] {
+        put_object(&state, &format!("/delpref/{key}"), b"x").await;
+    }
+
+    let mut q = BTreeMap::new();
+    q.insert("delimiter".into(), "/".into());
+    q.insert("max-keys".into(), "1".into());
+    let (status, _, body) =
+        signed_request(&state, Method::GET, "/delpref", q.clone(), Bytes::new(), &[]).await;
+    assert_eq!(status, StatusCode::OK);
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("<Key>asdf</Key>"));
+    assert!(text.contains("<NextMarker>asdf</NextMarker>"));
+
+    q.insert("marker".into(), "asdf".into());
+    let (status, _, body) =
+        signed_request(&state, Method::GET, "/delpref", q, Bytes::new(), &[]).await;
+    assert_eq!(status, StatusCode::OK);
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("<Prefix>boo/</Prefix>"));
+    assert!(text.contains("<NextMarker>boo/</NextMarker>"));
+}
+
+#[tokio::test]
+async fn put_object_latin1_user_metadata_roundtrip() {
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let state = app_state(&tmp);
+    ensure_bucket(&state, "unicodemeta").await;
+
+    // Build a signed PUT, then attach an unsigned Latin-1 metadata header (s3-tests style).
+    let body = Bytes::from_static(b"bar");
+    let path = "/unicodemeta/foo";
+    let host = "127.0.0.1:9000";
+    let signed = common::sign_headers("PUT", path, &BTreeMap::new(), &body, host);
+    let mut builder = http::Request::builder().method(Method::PUT).uri(path);
+    for (k, v) in &signed {
+        builder = builder.header(k.as_str(), v.as_str());
+    }
+    let mut latin1 = b"Hello World".to_vec();
+    latin1.push(0xe9);
+    builder = builder.header(
+        "x-amz-meta-meta1",
+        http::HeaderValue::from_bytes(&latin1).unwrap(),
+    );
+    let req = builder
+        .body(axum::body::Body::from(body.clone()))
+        .unwrap();
+    let app = flash_s3_engine::api::router(state.clone());
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let (status, headers, _) =
+        signed_request(&state, Method::GET, path, BTreeMap::new(), Bytes::new(), &[]).await;
+    assert_eq!(status, StatusCode::OK);
+    let got = headers
+        .get("x-amz-meta-meta1")
+        .expect("metadata header")
+        .as_bytes();
+    assert_eq!(got, latin1.as_slice());
+    let _ = BodyExt::collect(resp.into_body()).await;
+}
+
+#[tokio::test]
+async fn put_and_list_object_key_with_trailing_slash() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = app_state(&tmp);
+    ensure_bucket(&state, "trailslash").await;
+    put_object(&state, "/trailslash/asdf/", b"dir").await;
+
+    let mut q = BTreeMap::new();
+    q.insert("prefix".into(), "asdf/".into());
+    q.insert("delimiter".into(), "/".into());
+    let (status, _, body) =
+        signed_request(&state, Method::GET, "/trailslash", q, Bytes::new(), &[]).await;
+    assert_eq!(status, StatusCode::OK);
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("<Key>asdf/</Key>"), "{text}");
+    assert!(!text.contains("<CommonPrefixes>"), "{text}");
 }
 
 #[tokio::test]
