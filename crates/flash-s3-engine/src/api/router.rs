@@ -282,6 +282,13 @@ async fn dispatch_inner(
         &payload_hash,
     )?;
     validate_buffered_integrity(&headers, &body_bytes)?;
+    // Query-string auth may bind a concrete payload hash (`X-Amz-Content-Sha256`).
+    // S3 verifies the body against that value when it is not UNSIGNED-PAYLOAD.
+    if let Some(expected) = query_map.get("X-Amz-Content-Sha256") {
+        if expected != "UNSIGNED-PAYLOAD" && expected.as_str() != hash_payload(&body_bytes) {
+            return Err(FlashError::ContentSha256Mismatch);
+        }
+    }
 
     // Require auth for mutating service ops when keys exist
     if path.is_none() && method == Method::GET {

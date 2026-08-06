@@ -184,27 +184,104 @@ pub async fn anon_request_with_headers(
     (status, resp_headers, bytes)
 }
 
-/// Build a SigV4 query string for a presigned PUT (no leading `?`).
-pub fn presigned_put_query(path: &str, expires: u32) -> String {
+/// Options for building a SigV4 query-auth (presigned) request.
+#[derive(Debug, Clone)]
+pub struct PresignOpts<'a> {
+    pub method: &'a str,
+    pub path: &'a str,
+    pub expires: u32,
+    /// Extra query params included in the signature (e.g. `x-id=PutObject`).
+    pub extra_query: &'a [(&'a str, &'a str)],
+    /// Headers that are signed and must be sent with the request.
+    /// Always includes `host`; add e.g. `content-type`.
+    pub signed_headers: &'a [&'a str],
+    /// Header values for signed headers (except host, which is fixed).
+    pub header_values: &'a [(&'a str, &'a str)],
+    /// Payload hash in the canonical request (`UNSIGNED-PAYLOAD` or hex SHA-256).
+    pub payload_hash: &'a str,
+    /// Optional override for `X-Amz-Date` / credential date (testing expiry).
+    pub amz_date: Option<&'a str>,
+    pub scope_date: Option<&'a str>,
+    pub host: &'a str,
+}
+
+impl<'a> Default for PresignOpts<'a> {
+    fn default() -> Self {
+        Self {
+            method: "PUT",
+            path: "/",
+            expires: 900,
+            extra_query: &[("x-id", "PutObject")],
+            signed_headers: &["host"],
+            header_values: &[],
+            payload_hash: "UNSIGNED-PAYLOAD",
+            amz_date: None,
+            scope_date: None,
+            host: "127.0.0.1:9000",
+        }
+    }
+}
+
+/// Build a SigV4 query string for a presigned request (no leading `?`).
+pub fn presign_query(opts: &PresignOpts<'_>) -> String {
     let now = Utc::now();
-    let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
-    let date = now.format("%Y%m%d").to_string();
+    let amz_date = opts
+        .amz_date
+        .map(str::to_string)
+        .unwrap_or_else(|| now.format("%Y%m%dT%H%M%SZ").to_string());
+    let date = opts
+        .scope_date
+        .map(str::to_string)
+        .unwrap_or_else(|| now.format("%Y%m%d").to_string());
     let credential = format!("{ACCESS}/{date}/{REGION}/s3/aws4_request");
+
     let mut query: BTreeMap<String, String> = BTreeMap::new();
     query.insert("X-Amz-Algorithm".into(), "AWS4-HMAC-SHA256".into());
     query.insert("X-Amz-Credential".into(), credential);
     query.insert("X-Amz-Date".into(), amz_date.clone());
-    query.insert("X-Amz-Expires".into(), expires.to_string());
-    query.insert("X-Amz-SignedHeaders".into(), "host".into());
-    query.insert("x-id".into(), "PutObject".into());
+    query.insert("X-Amz-Expires".into(), opts.expires.to_string());
+    let mut signed: Vec<String> = opts.signed_headers.iter().map(|s| s.to_ascii_lowercase()).collect();
+    signed.sort();
+    signed.dedup();
+    query.insert("X-Amz-SignedHeaders".into(), signed.join(";"));
+    if opts.payload_hash != "UNSIGNED-PAYLOAD" {
+        query.insert("X-Amz-Content-Sha256".into(), opts.payload_hash.to_string());
+    }
+    for (k, v) in opts.extra_query {
+        query.insert((*k).into(), (*v).into());
+    }
 
     let mut parts = Vec::with_capacity(query.len());
     for (k, v) in &query {
         parts.push(format!("{}={}", uri_encode(k), uri_encode(v)));
     }
     let canonical_query = parts.join("&");
+
+    let mut canonical_headers = String::new();
+    for name in &signed {
+        let value = if name == "host" {
+            opts.host.to_string()
+        } else {
+            opts.header_values
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| (*v).to_string())
+                .unwrap_or_default()
+        };
+        canonical_headers.push_str(name);
+        canonical_headers.push(':');
+        canonical_headers.push_str(value.trim());
+        canonical_headers.push('\n');
+    }
+
     let canonical_request = format!(
-        "PUT\n{path}\n{canonical_query}\nhost:127.0.0.1:9000\n\nhost\nUNSIGNED-PAYLOAD"
+        "{}\n{}\n{}\n{}\n{}\n{}",
+        opts.method,
+        opts.path,
+        canonical_query,
+        canonical_headers,
+        signed.join(";"),
+        opts.payload_hash
     );
     let scope = format!("{date}/{REGION}/s3/aws4_request");
     let string_to_sign = format!(
@@ -217,4 +294,44 @@ pub fn presigned_put_query(path: &str, expires: u32) -> String {
     let k_signing = hmac_sha256(&k_service, b"aws4_request");
     let signature = hex::encode(hmac_sha256(&k_signing, string_to_sign.as_bytes()));
     format!("{canonical_query}&X-Amz-Signature={signature}")
+}
+
+/// Build a SigV4 query string for a presigned PUT (no leading `?`).
+pub fn presigned_put_query(path: &str, expires: u32) -> String {
+    presign_query(&PresignOpts {
+        method: "PUT",
+        path,
+        expires,
+        ..PresignOpts::default()
+    })
+}
+
+/// Perform an anonymous HTTP request authenticated only via a presigned query.
+pub async fn presigned_request(
+    state: &AppState,
+    method: Method,
+    path: &str,
+    query: &str,
+    body: Bytes,
+    headers: &[(&str, &str)],
+) -> (StatusCode, http::HeaderMap, Bytes) {
+    let uri = if query.is_empty() {
+        path.to_string()
+    } else {
+        format!("{path}?{query}")
+    };
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("host", "127.0.0.1:9000");
+    for (k, v) in headers {
+        builder = builder.header(*k, *v);
+    }
+    let req = builder.body(Body::from(body)).unwrap();
+    let app = router(state.clone());
+    let resp = app.oneshot(req).await.expect("response");
+    let status = resp.status();
+    let resp_headers = resp.headers().clone();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, resp_headers, bytes)
 }

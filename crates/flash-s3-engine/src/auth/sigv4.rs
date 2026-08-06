@@ -507,6 +507,108 @@ mod tests {
     }
 
     #[test]
+    fn rejects_presigned_expires_outside_one_to_seven_days() {
+        let (_dir, creds) = credentials();
+        let now = Utc::now();
+        let date = now.format("%Y%m%dT%H%M%SZ").to_string();
+        let scope_date = now.format("%Y%m%d").to_string();
+        let path = "/bucket/key";
+        let mut headers = HeaderMap::new();
+        headers.insert("host", HeaderValue::from_static(HOST));
+
+        for expires in [0_i64, 604_801] {
+            let unsigned_query = format!(
+                "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential={ACCESS_KEY}%2F{scope_date}%2F{REGION}%2Fs3%2Faws4_request&X-Amz-Date={date}&X-Amz-Expires={expires}&X-Amz-SignedHeaders=host"
+            );
+            let signature = sign_presigned(
+                "PUT",
+                path,
+                &unsigned_query,
+                &date,
+                &scope_date,
+                &headers,
+            );
+            let raw_query = format!("{unsigned_query}&X-Amz-Signature={signature}");
+            let query = parse_query(&raw_query);
+            let err = verify_request("PUT", path, &query, &raw_query, &headers, "", REGION, &creds)
+                .unwrap_err();
+            assert_eq!(err, flash_s3_common::FlashError::AccessDenied);
+        }
+    }
+
+    #[test]
+    fn rejects_presigned_with_wrong_algorithm() {
+        let (_dir, creds) = credentials();
+        let now = Utc::now();
+        let date = now.format("%Y%m%dT%H%M%SZ").to_string();
+        let scope_date = now.format("%Y%m%d").to_string();
+        let path = "/bucket/key";
+        let unsigned_query = format!(
+            "X-Amz-Algorithm=AWS4-HMAC-SHA1&X-Amz-Credential={ACCESS_KEY}%2F{scope_date}%2F{REGION}%2Fs3%2Faws4_request&X-Amz-Date={date}&X-Amz-Expires=900&X-Amz-SignedHeaders=host"
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert("host", HeaderValue::from_static(HOST));
+        // Sign as if algorithm were correct so we isolate the algorithm check.
+        let good_unsigned = unsigned_query.replace("AWS4-HMAC-SHA1", "AWS4-HMAC-SHA256");
+        let signature = sign_presigned(
+            "PUT",
+            path,
+            &good_unsigned,
+            &date,
+            &scope_date,
+            &headers,
+        );
+        let raw_query = format!("{unsigned_query}&X-Amz-Signature={signature}");
+        let query = parse_query(&raw_query);
+        assert!(verify_request("PUT", path, &query, &raw_query, &headers, "", REGION, &creds)
+            .is_err());
+    }
+
+    #[test]
+    fn rejects_presigned_missing_required_query_params() {
+        let (_dir, creds) = credentials();
+        let mut headers = HeaderMap::new();
+        headers.insert("host", HeaderValue::from_static(HOST));
+        let raw_query = "X-Amz-Signature=abcd";
+        let query = parse_query(raw_query);
+        assert!(verify_request("PUT", "/b/k", &query, raw_query, &headers, "", REGION, &creds)
+            .is_err());
+    }
+
+    #[test]
+    fn accepts_presigned_with_min_and_max_expires() {
+        let (_dir, creds) = credentials();
+        let now = Utc::now();
+        let date = now.format("%Y%m%dT%H%M%SZ").to_string();
+        let scope_date = now.format("%Y%m%d").to_string();
+        let path = "/bucket/key";
+        let mut headers = HeaderMap::new();
+        headers.insert("host", HeaderValue::from_static(HOST));
+
+        for expires in [1_u32, 604_800] {
+            let unsigned_query = format!(
+                "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential={ACCESS_KEY}%2F{scope_date}%2F{REGION}%2Fs3%2Faws4_request&X-Amz-Date={date}&X-Amz-Expires={expires}&X-Amz-SignedHeaders=host"
+            );
+            let signature = sign_presigned(
+                "PUT",
+                path,
+                &unsigned_query,
+                &date,
+                &scope_date,
+                &headers,
+            );
+            let raw_query = format!("{unsigned_query}&X-Amz-Signature={signature}");
+            let query = parse_query(&raw_query);
+            assert!(
+                verify_request("PUT", path, &query, &raw_query, &headers, "", REGION, &creds)
+                    .unwrap()
+                    .is_some(),
+                "expires={expires}"
+            );
+        }
+    }
+
+    #[test]
     fn validates_chained_streaming_chunk_signatures() {
         let key = signing_key(SECRET_KEY, "20260722", REGION, "s3");
         let mut signing = ChunkSigning {
