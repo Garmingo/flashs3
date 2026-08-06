@@ -4,7 +4,7 @@
 # `v` is stripped so Cargo gets a semver package version.
 FROM rust:1.93-bookworm AS builder
 WORKDIR /app
-ARG VERSION=0.3.1
+ARG VERSION=0.3.2
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 RUN VER="${VERSION#v}" \
@@ -12,7 +12,7 @@ RUN VER="${VERSION#v}" \
     && cargo build --release -p flash-s3-engine
 
 FROM debian:bookworm-slim
-ARG VERSION=0.3.1
+ARG VERSION=0.3.2
 LABEL org.opencontainers.image.version="${VERSION}"
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
