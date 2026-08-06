@@ -104,6 +104,45 @@ async fn get_bucket_location() {
 }
 
 #[tokio::test]
+async fn list_object_versions_non_versioned_for_cleanup() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = app_state(&tmp);
+    ensure_bucket(&state, "verlist").await;
+    put_object(&state, "/verlist/a", b"1").await;
+    put_object(&state, "/verlist/b", b"2").await;
+
+    let mut q = BTreeMap::new();
+    q.insert("versions".into(), "".into());
+    let (status, _, body) =
+        signed_request(&state, Method::GET, "/verlist", q.clone(), Bytes::new(), &[]).await;
+    assert_eq!(status, StatusCode::OK);
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("ListVersionsResult"));
+    assert!(text.contains("<VersionId>null</VersionId>"));
+    assert!(text.contains("<Key>a</Key>"));
+    assert!(text.contains("<Key>b</Key>"));
+
+    // Emulate s3-tests nuke: DeleteObjects then DeleteBucket.
+    let xml = r#"<?xml version="1.0"?><Delete><Object><Key>a</Key><VersionId>null</VersionId></Object><Object><Key>b</Key><VersionId>null</VersionId></Object></Delete>"#;
+    let mut dq = BTreeMap::new();
+    dq.insert("delete".into(), "".into());
+    let (status, _, _) = signed_request(
+        &state,
+        Method::POST,
+        "/verlist",
+        dq,
+        Bytes::from(xml),
+        &[("content-type", "application/xml")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _, _) =
+        signed_request(&state, Method::DELETE, "/verlist", BTreeMap::new(), Bytes::new(), &[]).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
 async fn delete_objects_multi() {
     let tmp = tempfile::tempdir().unwrap();
     let state = app_state(&tmp);

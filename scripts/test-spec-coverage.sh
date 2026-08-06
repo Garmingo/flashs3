@@ -26,8 +26,10 @@ SECRET_KEY="flashsecretmainxxxxxxxxxxxxxxxxxxxx"
 ALT_ACCESS="FLASHTESTALT"
 ALT_SECRET="flashsecretaltxxxxxxxxxxxxxxxxxxxxx"
 S3_TESTS_REPO="${S3_TESTS_REPO:-https://github.com/ceph/s3-tests.git}"
-# Current upstream layout is s3tests/functional (boto3). Override as needed.
-S3_TESTS_FILTER="${S3_TESTS_FILTER:-s3tests/functional}"
+# Core S3 surface only by default. IAM/STS/s3select need separate services and
+# would drown the summary in ClientError(Unknown) / setup noise.
+# Override: S3_TESTS_FILTER='s3tests/functional' ./scripts/test-spec-coverage.sh
+S3_TESTS_FILTER="${S3_TESTS_FILTER:-s3tests/functional/test_s3.py s3tests/functional/test_headers.py}"
 
 cleanup() {
   if [[ -n "${ENGINE_PID:-}" ]] && kill -0 "${ENGINE_PID}" 2>/dev/null; then
@@ -222,6 +224,13 @@ if [[ -f "${DATA_DIR}/s3tests.out" ]]; then
     echo "Last pytest result line:"
     grep -E '[0-9]+ (passed|failed|error|skipped)' "${DATA_DIR}/s3tests.out" | tail -3 || true
   fi
+  # Distinguish cascade setup errors from real assertion failures.
+  SETUP_ERRS=$(grep -c 'ERROR at setup of' "${DATA_DIR}/s3tests.out" 2>/dev/null || true)
+  BUCKET_NE=$(grep -c 'BucketNotEmpty' "${DATA_DIR}/s3tests.out" 2>/dev/null || true)
+  echo
+  echo "Note: pytest ERROR usually means exception during fixture setup/teardown"
+  echo "      (e.g. cleanup DeleteBucket), not an assertion failure (FAILED)."
+  echo "      setup_errors≈${SETUP_ERRS:-0}  BucketNotEmpty mentions≈${BUCKET_NE:-0}"
 fi
 cp -f "${ENGINE_LOG}" "${CACHE}/s3tests-engine-last.log" 2>/dev/null || true
 

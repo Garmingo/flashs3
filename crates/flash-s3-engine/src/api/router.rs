@@ -626,6 +626,58 @@ async fn bucket_ops(
         state.metrics.s3_requests.with_label_values(&["GET", "200", "ListMultipartUploads"]).inc();
         return Ok(xml_ok(body, request_id));
     }
+    // ListObjectVersions (non-versioned: current objects with VersionId=null).
+    // Required so clients/s3-tests can empty buckets before DeleteBucket.
+    if query.contains_key("versions") && *method == Method::GET {
+        let info = state.store.get_bucket(bucket).await?;
+        let policy = state.store.load_policy(bucket).await?;
+        let prefix = query.get("prefix").cloned().unwrap_or_default();
+        let delimiter = query.get("delimiter").map(|s| s.as_str());
+        let max_keys: usize = query
+            .get("max-keys")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1000)
+            .min(1000);
+        let key_marker = query.get("key-marker").map(|s| s.as_str());
+        let version_id_marker = query.get("version-id-marker").map(|s| s.as_str());
+        let condition_ctx = PolicyConditionCtx {
+            access_key: ctx.access_key(),
+            s3_prefix: Some(&prefix),
+            s3_delimiter: delimiter,
+            s3_x_amz_acl: None,
+        };
+        state.authorizer.authorize_with_ctx(
+            ctx,
+            S3Action::ListBucket,
+            Some(&info),
+            None,
+            policy.as_ref(),
+            Some(&condition_ctx),
+        )?;
+        let result = state
+            .store
+            .list_objects(bucket, &prefix, key_marker, delimiter, max_keys)?;
+        let body = xml::list_object_versions_xml(
+            bucket,
+            &prefix,
+            delimiter,
+            key_marker,
+            version_id_marker,
+            max_keys,
+            result.truncated,
+            &result.contents,
+            &result.common_prefixes,
+            result.next_token.as_deref(),
+            info.owner.as_str(),
+            &info.owner_display_name,
+        );
+        state
+            .metrics
+            .s3_requests
+            .with_label_values(&["GET", "200", "ListObjectVersions"])
+            .inc();
+        return Ok(xml_ok(body, request_id));
+    }
 
     match *method {
         Method::PUT => {

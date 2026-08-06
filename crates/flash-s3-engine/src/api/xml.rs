@@ -107,6 +107,65 @@ pub fn list_objects_v1_xml(
     body
 }
 
+/// `ListVersionsResult` for non-versioned buckets (each object as `VersionId=null`).
+///
+/// Enough for S3 clients / Ceph s3-tests cleanup (`nuke_bucket` uses ListObjectVersions
+/// before DeleteBucket). Full versioning is not implemented.
+pub fn list_object_versions_xml(
+    bucket: &str,
+    prefix: &str,
+    delimiter: Option<&str>,
+    key_marker: Option<&str>,
+    version_id_marker: Option<&str>,
+    max_keys: usize,
+    truncated: bool,
+    contents: &[IndexEntry],
+    common_prefixes: &[String],
+    next_key_marker: Option<&str>,
+    owner_id: &str,
+    owner_name: &str,
+) -> String {
+    let mut body = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?><ListVersionsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>{}</Name><Prefix>{}</Prefix><KeyMarker>{}</KeyMarker><VersionIdMarker>{}</VersionIdMarker><MaxKeys>{}</MaxKeys><IsTruncated>{}</IsTruncated>"#,
+        xml_escape(bucket),
+        xml_escape(prefix),
+        xml_escape(key_marker.unwrap_or("")),
+        xml_escape(version_id_marker.unwrap_or("")),
+        max_keys,
+        truncated
+    );
+    if let Some(d) = delimiter {
+        body.push_str(&format!("<Delimiter>{}</Delimiter>", xml_escape(d)));
+    }
+    if truncated {
+        if let Some(k) = next_key_marker {
+            body.push_str(&format!(
+                "<NextKeyMarker>{}</NextKeyMarker><NextVersionIdMarker>null</NextVersionIdMarker>",
+                xml_escape(k)
+            ));
+        }
+    }
+    for c in contents {
+        body.push_str(&format!(
+            "<Version><Key>{}</Key><VersionId>null</VersionId><IsLatest>true</IsLatest><LastModified>{}</LastModified><ETag>{}</ETag><Size>{}</Size><StorageClass>STANDARD</StorageClass><Owner><ID>{}</ID><DisplayName>{}</DisplayName></Owner></Version>",
+            xml_escape(&c.key),
+            xml_escape(&c.last_modified),
+            xml_escape(&c.etag),
+            c.size,
+            xml_escape(owner_id),
+            xml_escape(owner_name)
+        ));
+    }
+    for p in common_prefixes {
+        body.push_str(&format!(
+            "<CommonPrefixes><Prefix>{}</Prefix></CommonPrefixes>",
+            xml_escape(p)
+        ));
+    }
+    body.push_str("</ListVersionsResult>");
+    body
+}
+
 fn append_contents_and_prefixes(
     body: &mut String,
     contents: &[IndexEntry],
