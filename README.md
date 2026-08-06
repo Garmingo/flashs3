@@ -232,10 +232,13 @@ against a temporary local engine to see remaining API gaps:
 
 ```bash
 ./scripts/test-spec-coverage.sh
+# optional narrower filter:
+S3_TESTS_FILTER='s3tests/functional/test_s3.py' ./scripts/test-spec-coverage.sh
 ```
 
-Requires `cargo`, `python3`, `curl`, and network access on first run (clones into `.cache/s3-tests`).
-The script always exits 0; inspect `.cache/s3tests-last.out` for the summary.
+Requires `cargo`, `python3` (+`venv`), `curl`, and network access on first run
+(clones into `.cache/s3-tests`, creates `.cache/s3-tests-venv`). The script always
+exits 0; inspect `.cache/s3tests-last.out` for the summary.
 ## Benchmarks
 
 ### FlashS3-only benchmarks

@@ -7,13 +7,15 @@
 #
 # Usage:
 #   ./scripts/test-spec-coverage.sh
-#   S3_TESTS_FILTER='s3tests_boto3/functional/test_s3.py' ./scripts/test-spec-coverage.sh
+#   S3_TESTS_FILTER='s3tests/functional/test_s3.py' ./scripts/test-spec-coverage.sh
+#   S3_TESTS_FILTER='s3tests/functional/test_s3.py::test_bucket_list_empty' ./scripts/test-spec-coverage.sh
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CACHE="${ROOT}/.cache"
 S3_TESTS_DIR="${CACHE}/s3-tests"
+VENV_DIR="${CACHE}/s3-tests-venv"
 DATA_DIR="$(mktemp -d "${TMPDIR:-/tmp}/flashs3-s3tests.XXXXXX")"
 ENGINE_LOG="${DATA_DIR}/engine.log"
 CONF="${DATA_DIR}/s3tests.conf"
@@ -24,7 +26,8 @@ SECRET_KEY="flashsecretmainxxxxxxxxxxxxxxxxxxxx"
 ALT_ACCESS="FLASHTESTALT"
 ALT_SECRET="flashsecretaltxxxxxxxxxxxxxxxxxxxxx"
 S3_TESTS_REPO="${S3_TESTS_REPO:-https://github.com/ceph/s3-tests.git}"
-S3_TESTS_FILTER="${S3_TESTS_FILTER:-s3tests_boto3/functional}"
+# Current upstream layout is s3tests/functional (boto3). Override as needed.
+S3_TESTS_FILTER="${S3_TESTS_FILTER:-s3tests/functional}"
 
 cleanup() {
   if [[ -n "${ENGINE_PID:-}" ]] && kill -0 "${ENGINE_PID}" 2>/dev/null; then
@@ -53,8 +56,20 @@ else
   echo "==> Using cached s3-tests at ${S3_TESTS_DIR}"
 fi
 
+echo "==> Preparing Python venv at ${VENV_DIR}"
+if [[ ! -x "${VENV_DIR}/bin/python" ]]; then
+  python3 -m venv "${VENV_DIR}"
+fi
+# shellcheck disable=SC1091
+source "${VENV_DIR}/bin/activate"
+python -m pip install --upgrade pip wheel setuptools >/dev/null
+python -m pip install -r "${S3_TESTS_DIR}/requirements.txt" >/dev/null
+python -m pip install -e "${S3_TESTS_DIR}" >/dev/null
+echo "    python   : $(command -v python) ($(python --version 2>&1))"
+echo "    pytest   : $(python -c 'import pytest; print(pytest.__version__)')"
+
 echo "==> Seeding credentials.json (main + alt)"
-python3 - <<PY
+python - <<PY
 import hashlib, json, pathlib
 def cid(ak: str) -> str:
     return hashlib.sha256(ak.encode()).hexdigest()
@@ -112,64 +127,105 @@ if ! curl -sf "http://${BIND_HOST}:${BIND_PORT}/healthz" >/dev/null 2>&1; then
 fi
 echo "==> Engine healthy (pid ${ENGINE_PID})"
 
-cat >"${CONF}" <<EOF
-[DEFAULT]
+echo "==> Writing s3tests.conf from upstream SAMPLE + local overrides"
+python - <<PY
+import hashlib
+from configparser import RawConfigParser
+from pathlib import Path
 
-[fixtures]
-bucket prefix = flashs3-s3tests-{random}-
+sample = Path("${S3_TESTS_DIR}/s3tests.conf.SAMPLE")
+out = Path("${CONF}")
+cfg = RawConfigParser()
+cfg.read(sample)
 
-[s3 main]
-display_name = main
-user_id = ${ACCESS_KEY}
-email = main@flashs3.local
-access_key = ${ACCESS_KEY}
-secret_key = ${SECRET_KEY}
-api_name = flashs3
-host = ${BIND_HOST}
-port = ${BIND_PORT}
-is_secure = no
+def cid(ak: str) -> str:
+    return hashlib.sha256(ak.encode()).hexdigest()
 
-[s3 alt]
-display_name = alt
-user_id = ${ALT_ACCESS}
-email = alt@flashs3.local
-access_key = ${ALT_ACCESS}
-secret_key = ${ALT_SECRET}
+main_ak = "${ACCESS_KEY}"
+main_sk = "${SECRET_KEY}"
+alt_ak = "${ALT_ACCESS}"
+alt_sk = "${ALT_SECRET}"
+main_uid = cid(main_ak)
+alt_uid = cid(alt_ak)
 
-[s3 tenant]
-display_name = alt
-user_id = ${ALT_ACCESS}
-email = alt@flashs3.local
-access_key = ${ALT_ACCESS}
-secret_key = ${ALT_SECRET}
-EOF
+cfg["DEFAULT"]["host"] = "${BIND_HOST}"
+cfg["DEFAULT"]["port"] = "${BIND_PORT}"
+cfg["DEFAULT"]["is_secure"] = "False"
+cfg["DEFAULT"]["ssl_verify"] = "False"
 
-echo "==> Running s3-tests (failures expected; coverage benchmark only)"
+cfg["fixtures"]["bucket prefix"] = "flashs3-s3tests-{random}-"
+
+cfg["s3 main"]["display_name"] = "main"
+cfg["s3 main"]["user_id"] = main_uid
+cfg["s3 main"]["email"] = "main@flashs3.local"
+cfg["s3 main"]["api_name"] = "us-east-1"
+cfg["s3 main"]["access_key"] = main_ak
+cfg["s3 main"]["secret_key"] = main_sk
+
+cfg["s3 alt"]["display_name"] = "alt"
+cfg["s3 alt"]["user_id"] = alt_uid
+cfg["s3 alt"]["email"] = "alt@flashs3.local"
+cfg["s3 alt"]["access_key"] = alt_ak
+cfg["s3 alt"]["secret_key"] = alt_sk
+
+cfg["s3 tenant"]["display_name"] = "tenant"
+cfg["s3 tenant"]["user_id"] = alt_uid
+cfg["s3 tenant"]["email"] = "tenant@flashs3.local"
+cfg["s3 tenant"]["access_key"] = alt_ak
+cfg["s3 tenant"]["secret_key"] = alt_sk
+cfg["s3 tenant"]["tenant"] = "flashs3"
+
+# IAM sections are required at configure() time even if those tests are skipped.
+for section, ak, sk, uid, email, display in [
+    ("iam", main_ak, main_sk, main_uid, "iam@flashs3.local", "main"),
+    ("iam root", main_ak, main_sk, main_uid, "iam-root@flashs3.local", "main"),
+    ("iam alt root", alt_ak, alt_sk, alt_uid, "iam-alt@flashs3.local", "alt"),
+]:
+    if not cfg.has_section(section):
+        cfg.add_section(section)
+    cfg[section]["access_key"] = ak
+    cfg[section]["secret_key"] = sk
+    cfg[section]["user_id"] = uid
+    cfg[section]["email"] = email
+    cfg[section]["display_name"] = display
+    if section.startswith("iam") and "root" in section:
+        cfg[section]["account_id"] = uid
+
+with out.open("w") as f:
+    cfg.write(f)
+print(out)
+PY
+
+echo "==> Running s3-tests via pytest (failures expected; coverage benchmark only)"
 set +e
 (
   cd "${S3_TESTS_DIR}"
-  if [[ -f tox.ini ]] && command -v tox >/dev/null; then
-    S3TEST_CONF="${CONF}" tox -- "${S3_TESTS_FILTER}" 2>&1 | tee "${DATA_DIR}/s3tests.out"
-  elif [[ -f tox.ini ]]; then
-    python3 -m pip install --user 'tox' >/dev/null 2>&1 || true
-    S3TEST_CONF="${CONF}" python3 -m tox -- "${S3_TESTS_FILTER}" 2>&1 | tee "${DATA_DIR}/s3tests.out"
-  else
-    python3 -m pip install --user pytest boto3 botocore >/dev/null 2>&1 || true
-    S3TEST_CONF="${CONF}" python3 -m pytest "${S3_TESTS_FILTER}" -q --tb=line 2>&1 | tee "${DATA_DIR}/s3tests.out"
-  fi
+  # Prefer an explicit path under s3tests/; fall back if caller passed a custom filter.
+  FILTER_ARGS=()
+  # shellcheck disable=SC2206
+  FILTER_ARGS=(${S3_TESTS_FILTER})
+  S3TEST_CONF="${CONF}" python -m pytest "${FILTER_ARGS[@]}" -q --tb=line 2>&1 \
+    | tee "${DATA_DIR}/s3tests.out"
 )
-STATUS=$?
+STATUS=${PIPESTATUS[0]}
 set -e
 
 echo
 echo "==> Coverage summary"
 if [[ -f "${DATA_DIR}/s3tests.out" ]]; then
-  grep -E 'passed|failed|error|skipped|=+' "${DATA_DIR}/s3tests.out" | tail -30 || true
+  # pytest short summary / progress line
+  grep -E 'passed|failed|error|skipped|xfailed|xpassed|====' "${DATA_DIR}/s3tests.out" | tail -40 || true
   cp -f "${DATA_DIR}/s3tests.out" "${CACHE}/s3tests-last.out" 2>/dev/null || true
+  # Compact counts if present
+  if grep -qE '[0-9]+ (passed|failed)' "${DATA_DIR}/s3tests.out"; then
+    echo
+    echo "Last pytest result line:"
+    grep -E '[0-9]+ (passed|failed|error|skipped)' "${DATA_DIR}/s3tests.out" | tail -3 || true
+  fi
 fi
 cp -f "${ENGINE_LOG}" "${CACHE}/s3tests-engine-last.log" 2>/dev/null || true
 
 echo
-echo "Benchmark finished (s3-tests exit=${STATUS})."
+echo "Benchmark finished (pytest exit=${STATUS})."
 echo "Always exiting 0 so this never gates CI; see .cache/s3tests-last.out"
 exit 0
