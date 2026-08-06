@@ -175,8 +175,8 @@ async fn ensure_secret(
     if api.get(&secret_name).await.is_ok() {
         return Ok(secret_name);
     }
-    let access = format!("flash{}", &uuid_like(name)[..8.min(uuid_like(name).len())]);
-    let secret_key = format!("sk-{}", uuid_like(&format!("{name}-secret")));
+    let access = format!("flash_ak_{}", random_credential(32));
+    let secret_key = format!("flash_sk_{}", random_credential(64));
     let secret = Secret {
         metadata: ObjectMeta {
             name: Some(secret_name.clone()),
@@ -204,12 +204,15 @@ async fn ensure_secret(
     Ok(secret_name)
 }
 
-fn uuid_like(s: &str) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut h = DefaultHasher::new();
-    s.hash(&mut h);
-    format!("{:x}", h.finish())
+/// Cryptographically secure alphanumeric credential (`OsRng`).
+fn random_credential(len: usize) -> String {
+    use rand::rngs::OsRng;
+    use rand::{distributions::Alphanumeric, Rng};
+    OsRng
+        .sample_iter(&Alphanumeric)
+        .take(len)
+        .map(char::from)
+        .collect()
 }
 
 async fn ensure_deployment(
@@ -433,6 +436,24 @@ fn env_from_secret(name: &str, secret: &str, key: &str) -> EnvVar {
             ..Default::default()
         }),
         ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::random_credential;
+
+    #[test]
+    fn random_credentials_have_expected_length() {
+        let access = format!("flash_ak_{}", random_credential(32));
+        let secret = format!("flash_sk_{}", random_credential(64));
+        assert_eq!(access.len(), "flash_ak_".len() + 32);
+        assert_eq!(secret.len(), "flash_sk_".len() + 64);
+        assert!(access.starts_with("flash_ak_"));
+        assert!(secret.starts_with("flash_sk_"));
+        assert!(access[9..].chars().all(|c| c.is_ascii_alphanumeric()));
+        assert!(secret[9..].chars().all(|c| c.is_ascii_alphanumeric()));
+        assert_ne!(random_credential(64), random_credential(64));
     }
 }
 

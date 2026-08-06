@@ -82,11 +82,11 @@ Release tags trigger GitLab CI (Kaniko), which publishes two public images to Do
 Both images also receive the `latest` tag. Example using a fixed release:
 
 ```text
-docker.io/garmingo/flashs3:v0.2.8
-docker.io/garmingo/flashs3-operator:v0.2.8
+docker.io/garmingo/flashs3:v0.3.0
+docker.io/garmingo/flashs3-operator:v0.3.0
 ```
 
-Release builds set the binary version from the Git tag (`VERSION` build argument → `CARGO_PKG_VERSION`). A `v0.2.8` tag makes `flash-s3-engine --version` report `0.2.8`.
+Release builds set the binary version from the Git tag (`VERSION` build argument → `CARGO_PKG_VERSION`). A `v0.3.0` tag makes `flash-s3-engine --version` report `0.3.0`.
 
 ### Run the engine standalone (without the operator)
 
@@ -138,7 +138,7 @@ Without this mount, `kube::Client::try_default()` fails with
 `failed to read the default namespace`.
 
 For production, pin the operator image to a release tag (for example,
-`docker.io/garmingo/flashs3-operator:v0.2.8`).
+`docker.io/garmingo/flashs3-operator:v0.3.0`).
 
 ```bash
 kubectl -n flashs3-system rollout status deploy/flash-s3-operator
@@ -188,7 +188,7 @@ spec:
   retainPvc: true
 ```
 
-Credentials: if `spec.auth.secretRef` is omitted, the operator creates a Secret containing root keys. `spec.defaultBucketName` is optional; when set, the engine creates that bucket idempotently on startup. `spec.cors` is optional and requires `defaultBucketName`; use either `allowAll: true` (permissive, local/dev) or explicit `rules` (not both). The operator maps this to `FLASHS3_DEFAULT_BUCKET_CORS_ALLOW_ALL` / `FLASHS3_DEFAULT_BUCKET_CORS`, and the engine writes `cors.xml` on start. CORS can also be managed at runtime with the S3 API (`put-bucket-cors`). The resulting endpoint is, for example, `http://media.default.svc:9000`.
+Credentials: if `spec.auth.secretRef` is omitted, the operator creates a Secret with a cryptographically random `accessKey` (`flash_ak_` + 32 chars) and `secretKey` (`flash_sk_` + 64 chars) via OS CSPRNG; created once, never rotated. `spec.defaultBucketName` is optional; when set, the engine creates that bucket idempotently on startup. `spec.cors` is optional and requires `defaultBucketName`; use either `allowAll: true` (permissive, local/dev) or explicit `rules` (not both). The operator maps this to `FLASHS3_DEFAULT_BUCKET_CORS_ALLOW_ALL` / `FLASHS3_DEFAULT_BUCKET_CORS`, and the engine writes `cors.xml` on start. CORS can also be managed at runtime with the S3 API (`put-bucket-cors`). The resulting endpoint is, for example, `http://media.default.svc:9000`.
 
 ## Env
 
@@ -260,7 +260,7 @@ The benchmark environment is:
 | Workload matrix | 2,000 objects × 64 KiB, 128 KiB, and 1 MiB × 16, 32, and 1 concurrent clients |
 | Protocol | Path-style S3 over HTTP with AWS SigV4 |
 | FlashS3 cache | `InMemoryLRU`, 512 MiB maximum |
-| FlashS3 | `docker.io/garmingo/flashs3:v0.2.8` |
+| FlashS3 | `docker.io/garmingo/flashs3:v0.3.0` |
 | MinIO | `minio/minio:RELEASE.2025-04-22T22-12-26Z` |
 | Garage | `dxflrs/garage:v2.3.0` in single-node mode |
 
