@@ -3,7 +3,7 @@
 //! Avoiding a heavy schema stack keeps the binary small; parsers are intentionally
 //! tolerant rather than fully XSD-compliant.
 
-use flash_s3_common::{AccessControlPolicy, Grantee, GroupUri};
+use flash_s3_common::{AccessControlPolicy, CorsConfiguration, CorsRule, Grantee, GroupUri};
 
 use super::error::xml_escape;
 use crate::storage::{BucketInfo, IndexEntry};
@@ -158,6 +158,68 @@ pub fn parse_acl_xml(raw: &str, fallback_owner: &AccessControlPolicy) -> Result<
         owner_display_name: owner_display,
         grants,
     })
+}
+
+/// `CORSConfiguration` XML for GetBucketCors.
+pub fn cors_xml(cors: &CorsConfiguration) -> String {
+    cors.to_xml()
+}
+
+/// Parse `CORSConfiguration` XML for PutBucketCors.
+pub fn parse_cors_xml(raw: &str) -> Result<CorsConfiguration, flash_s3_common::FlashError> {
+    if !raw.contains("CORSConfiguration") && !raw.contains("CORSRule") {
+        return Err(flash_s3_common::FlashError::MalformedCORSConfiguration);
+    }
+    let mut rules = Vec::new();
+    let mut rest = raw;
+    while let Some(block) = extract_block(rest, "CORSRule") {
+        let id = extract_tag(&block, "ID");
+        let allowed_origins = extract_all_tags(&block, "AllowedOrigin");
+        let allowed_methods = extract_all_tags(&block, "AllowedMethod");
+        let allowed_headers = extract_all_tags(&block, "AllowedHeader");
+        let expose_headers = extract_all_tags(&block, "ExposeHeader");
+        let max_age_seconds = extract_tag(&block, "MaxAgeSeconds")
+            .map(|s| {
+                s.parse::<u32>()
+                    .map_err(|_| flash_s3_common::FlashError::MalformedCORSConfiguration)
+            })
+            .transpose()?;
+        rules.push(CorsRule {
+            id,
+            allowed_origins,
+            allowed_methods: allowed_methods
+                .into_iter()
+                .map(|m| m.to_ascii_uppercase())
+                .collect(),
+            allowed_headers,
+            expose_headers,
+            max_age_seconds,
+        });
+        if let Some(idx) = rest.find("</CORSRule>") {
+            rest = &rest[idx + "</CORSRule>".len()..];
+        } else {
+            break;
+        }
+    }
+    let cors = CorsConfiguration { rules };
+    cors.validate()?;
+    Ok(cors)
+}
+
+fn extract_all_tags(xml: &str, tag: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    let start = format!("<{tag}>");
+    let end = format!("</{tag}>");
+    let mut rest = xml;
+    while let Some(i) = rest.find(&start) {
+        let after = i + start.len();
+        let Some(rel) = rest[after..].find(&end) else {
+            break;
+        };
+        values.push(rest[after..after + rel].to_string());
+        rest = &rest[after + rel + end.len()..];
+    }
+    values
 }
 
 fn extract_tag(xml: &str, tag: &str) -> Option<String> {

@@ -4,6 +4,8 @@
 //! ```text
 //! buckets/<name>/objects/<aa>/<bb>/<sha256>/current/{data,meta.json}
 //! buckets/<name>/multipart/<uploadId>/
+//! buckets/<name>/policy.json
+//! buckets/<name>/cors.xml
 //! index/objects.redb
 //! credentials.json
 //! ```

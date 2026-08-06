@@ -62,6 +62,12 @@ pub enum FlashError {
     /// No policy attached to the bucket.
     #[error("NoSuchBucketPolicy: The bucket policy does not exist")]
     NoSuchBucketPolicy,
+    /// CORS XML could not be parsed or failed validation.
+    #[error("MalformedXML: The CORS configuration XML is malformed")]
+    MalformedCORSConfiguration,
+    /// No CORS configuration attached to the bucket.
+    #[error("NoSuchCORSConfiguration: The CORS configuration does not exist")]
+    NoSuchCORSConfiguration,
     /// Generic client error with detail message.
     #[error("InvalidRequest: {0}")]
     InvalidRequest(String),
@@ -95,6 +101,8 @@ impl FlashError {
             Self::MalformedAcl => "MalformedACLError",
             Self::MalformedPolicy => "MalformedPolicy",
             Self::NoSuchBucketPolicy => "NoSuchBucketPolicy",
+            Self::MalformedCORSConfiguration => "MalformedXML",
+            Self::NoSuchCORSConfiguration => "NoSuchCORSConfiguration",
             Self::InvalidRequest(_) => "InvalidRequest",
             Self::Internal(_) => "InternalError",
             Self::NotImplemented(_) => "NotImplemented",
@@ -104,9 +112,11 @@ impl FlashError {
     /// Suggested HTTP status code for this error.
     pub fn http_status(&self) -> u16 {
         match self {
-            Self::NoSuchBucket | Self::NoSuchKey | Self::NoSuchUpload | Self::NoSuchBucketPolicy => {
-                404
-            }
+            Self::NoSuchBucket
+            | Self::NoSuchKey
+            | Self::NoSuchUpload
+            | Self::NoSuchBucketPolicy
+            | Self::NoSuchCORSConfiguration => 404,
             Self::AccessDenied | Self::InvalidAccessKeyId | Self::SignatureDoesNotMatch => 403,
             Self::BucketAlreadyOwnedByYou => 409,
             Self::BucketNotEmpty => 409,

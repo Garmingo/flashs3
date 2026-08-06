@@ -29,6 +29,23 @@ aws --endpoint-url http://127.0.0.1:9000 s3 cp s3://demo/file.bin ./out.bin
 aws --endpoint-url http://127.0.0.1:9000 s3api put-object-acl \
   --bucket demo --key file.bin --acl public-read
 curl -f http://127.0.0.1:9000/demo/file.bin -o /dev/null
+
+# Browser uploads: allow CORS preflight from a local web app
+cat > /tmp/cors.json <<'EOF'
+{
+  "CORSRules": [
+    {
+      "AllowedOrigins": ["http://localhost:3001"],
+      "AllowedMethods": ["PUT", "GET", "HEAD"],
+      "AllowedHeaders": ["*"],
+      "ExposeHeaders": ["ETag", "x-amz-request-id"],
+      "MaxAgeSeconds": 3000
+    }
+  ]
+}
+EOF
+aws --endpoint-url http://127.0.0.1:9000 s3api put-bucket-cors \
+  --bucket demo --cors-configuration file:///tmp/cors.json
 ```
 
 Ops endpoints: `/healthz`, `/readyz`, `/metrics`.
@@ -37,7 +54,7 @@ Ops endpoints: `/healthz`, `/readyz`, `/metrics`.
 
 | Crate | Role |
 |-------|--------|
-| `flash-s3-common` | Shared types for ACLs, policies, errors, and environment variables |
+| `flash-s3-common` | Shared types for ACLs, policies, CORS, errors, and environment variables |
 | `flash-s3-engine` | Standalone S3 storage engine |
 | `flash-s3-operator` | Optional kube-rs operator for `FlashS3Bucket` resources |
 
@@ -48,6 +65,7 @@ Ops endpoints: `/healthz`, `/readyz`, `/metrics`.
 - Multiple API keys (`credentials.json` in the data directory)
 - Rich S3 ACLs (bucket and object ACLs, canned ACLs, and grants)
 - Bucket policies (allow/deny, key principals, prefixes, and actions)
+- Bucket CORS (`PutBucketCors` / `GetBucketCors` / `DeleteBucketCors`, browser `OPTIONS` preflight, `Access-Control-*` on GET/PUT/HEAD)
 - Hybrid cache: small objects are written through to disk and cached in moka's byte-LRU; large objects stream directly to disk
 - Four-hex filesystem sharding (`aa/bb/<hash>/current/`)
 - Prometheus metrics, graceful shutdown, and panic isolation
@@ -78,6 +96,18 @@ docker pull docker.io/garmingo/flashs3:latest
 docker run --rm -p 9000:9000 \
   -e FLASHS3_ACCESS_KEY=flash \
   -e FLASHS3_SECRET_KEY=flashsecret \
+  -v flashs3-data:/data \
+  docker.io/garmingo/flashs3:latest
+```
+
+Local/dev with a bootstrap bucket and open CORS (browser uploads from any origin):
+
+```bash
+docker run --rm -p 9000:9000 \
+  -e FLASHS3_ACCESS_KEY=flash \
+  -e FLASHS3_SECRET_KEY=flashsecret \
+  -e FLASHS3_DEFAULT_BUCKET_NAME=demo \
+  -e FLASHS3_DEFAULT_BUCKET_CORS_ALLOW_ALL=true \
   -v flashs3-data:/data \
   docker.io/garmingo/flashs3:latest
 ```
@@ -138,6 +168,16 @@ spec:
   # Created automatically when the engine starts.
   defaultBucketName: media-assets
   defaultObjectAcl: private
+  # Applied to defaultBucketName on every engine start (browser uploads).
+  # Dev shortcut: cors: { allowAll: true }
+  cors:
+    rules:
+      - allowedOrigins:
+          - http://localhost:3001
+        allowedMethods: [PUT, GET, HEAD]
+        allowedHeaders: ["*"]
+        exposeHeaders: [ETag, x-amz-request-id]
+        maxAgeSeconds: 3000
   cache:
     policy: InMemoryLRU
     maxSizeInBytes: 2147483648
@@ -148,7 +188,7 @@ spec:
   retainPvc: true
 ```
 
-Credentials: if `spec.auth.secretRef` is omitted, the operator creates a Secret containing root keys. `spec.defaultBucketName` is optional; when set, the engine creates that bucket idempotently on startup. The resulting endpoint is, for example, `http://media.default.svc:9000`.
+Credentials: if `spec.auth.secretRef` is omitted, the operator creates a Secret containing root keys. `spec.defaultBucketName` is optional; when set, the engine creates that bucket idempotently on startup. `spec.cors` is optional and requires `defaultBucketName`; use either `allowAll: true` (permissive, local/dev) or explicit `rules` (not both). The operator maps this to `FLASHS3_DEFAULT_BUCKET_CORS_ALLOW_ALL` / `FLASHS3_DEFAULT_BUCKET_CORS`, and the engine writes `cors.xml` on start. CORS can also be managed at runtime with the S3 API (`put-bucket-cors`). The resulting endpoint is, for example, `http://media.default.svc:9000`.
 
 ## Env
 
@@ -164,6 +204,8 @@ Credentials: if `spec.auth.secretRef` is omitted, the operator creates a Secret 
 | `FLASHS3_REGION` | `us-east-1` |
 | `FLASHS3_DEFAULT_OBJECT_ACL` | `private` |
 | `FLASHS3_DEFAULT_BUCKET_NAME` | Optional bucket created idempotently on startup |
+| `FLASHS3_DEFAULT_BUCKET_CORS` | Optional camelCase JSON CORS (`{"rules":[…]}` or `{"allowAll":true}`) for the default bucket |
+| `FLASHS3_DEFAULT_BUCKET_CORS_ALLOW_ALL` | `false` — when `true`, apply permissive `*` CORS to the default bucket (local/dev; overrides `FLASHS3_DEFAULT_BUCKET_CORS`) |
 
 When `FLASHS3_CREDENTIALS_KEY` is set, each `secret_key` in `credentials.json` is stored as
 `enc:v1:…`. The same key is required on every start; losing it makes encrypted secrets unrecoverable.
@@ -174,8 +216,8 @@ When `FLASHS3_CREDENTIALS_KEY` is set, each `secret_key` in `credentials.json` i
 cargo test
 ```
 
-Coverage includes ACL/policy/identity unit tests plus engine integration tests
-(storage, HTTP/SigV4, cache, multipart, copy).
+Coverage includes ACL/policy/CORS/identity unit tests plus engine integration tests
+(storage, HTTP/SigV4, CORS preflight, cache, multipart, copy).
 
 ## Benchmarks
 

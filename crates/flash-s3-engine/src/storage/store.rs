@@ -1,4 +1,4 @@
-//! Disk-backed object store: buckets, objects, multipart, ACLs, policies.
+//! Disk-backed object store: buckets, objects, multipart, ACLs, policies, CORS.
 //!
 //! All mutating object paths take a per-`(bucket,key)` async mutex and write
 //! via temp file + `fsync` + `rename` for crash-safe puts.
@@ -321,6 +321,48 @@ impl ObjectStore {
         }
         let raw = tokio::fs::read_to_string(path).await.map_err(io_err)?;
         Ok(Some(BucketPolicy::parse_json(&raw)?))
+    }
+
+    pub async fn put_bucket_cors(&self, name: &str, raw_xml: &str) -> Result<(), FlashError> {
+        let _ = self.get_bucket(name).await?;
+        if raw_xml.len() > flash_s3_common::MAX_CORS_BYTES {
+            return Err(FlashError::InvalidRequest(
+                "CORS configuration exceeds 64 KiB".into(),
+            ));
+        }
+        atomic_write_bytes(
+            &layout::bucket_cors_path(&self.data_dir, name),
+            raw_xml.as_bytes(),
+        )
+        .await
+    }
+
+    pub async fn get_bucket_cors(&self, name: &str) -> Result<String, FlashError> {
+        let _ = self.get_bucket(name).await?;
+        let path = layout::bucket_cors_path(&self.data_dir, name);
+        if !path.exists() {
+            return Err(FlashError::NoSuchCORSConfiguration);
+        }
+        tokio::fs::read_to_string(path).await.map_err(io_err)
+    }
+
+    pub async fn delete_bucket_cors(&self, name: &str) -> Result<(), FlashError> {
+        let _ = self.get_bucket(name).await?;
+        let path = layout::bucket_cors_path(&self.data_dir, name);
+        if path.exists() {
+            tokio::fs::remove_file(path).await.map_err(io_err)?;
+        }
+        Ok(())
+    }
+
+    /// Load raw CORS XML when present (caller parses).
+    pub async fn load_cors_raw(&self, name: &str) -> Result<Option<String>, FlashError> {
+        let path = layout::bucket_cors_path(&self.data_dir, name);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let raw = tokio::fs::read_to_string(path).await.map_err(io_err)?;
+        Ok(Some(raw))
     }
 
     /// Write-through put: atomic disk write, then index update.

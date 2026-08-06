@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use flash_s3_common::FlashError;
+use flash_s3_common::{CorsConfiguration, FlashError};
 
 use crate::auth::{Authorizer, CredentialStore};
 use crate::cache::ObjectCache;
@@ -57,8 +57,19 @@ impl AppState {
     ///
     /// The operation is idempotent so restarts retain the existing bucket and
     /// its contents. A root credential is required to own the initial bucket.
+    ///
+    /// When [`Config::default_bucket_cors`] is set, the CORS configuration is
+    /// (re)applied after the bucket exists so CRD/env changes take effect on
+    /// restart without a separate S3 API call.
     pub async fn initialize_default_bucket(&self) -> Result<(), FlashError> {
         let Some(name) = self.config.default_bucket_name.as_deref() else {
+            if self.config.default_bucket_cors_allow_all || self.config.default_bucket_cors.is_some()
+            {
+                return Err(FlashError::InvalidRequest(
+                    "FLASHS3_DEFAULT_BUCKET_CORS(_ALLOW_ALL) requires FLASHS3_DEFAULT_BUCKET_NAME"
+                        .into(),
+                ));
+            }
             return Ok(());
         };
         let owner = self
@@ -82,8 +93,20 @@ impl AppState {
             )
             .await
         {
-            Ok(_) | Err(FlashError::BucketAlreadyOwnedByYou) => Ok(()),
-            Err(error) => Err(error),
+            Ok(_) | Err(FlashError::BucketAlreadyOwnedByYou) => {}
+            Err(error) => return Err(error),
         }
+
+        let cors = if self.config.default_bucket_cors_allow_all {
+            Some(CorsConfiguration::allow_all())
+        } else if let Some(cors_json) = self.config.default_bucket_cors.as_deref() {
+            Some(CorsConfiguration::parse_json(cors_json)?)
+        } else {
+            None
+        };
+        if let Some(cors) = cors {
+            self.store.put_bucket_cors(name, &cors.to_xml()).await?;
+        }
+        Ok(())
     }
 }

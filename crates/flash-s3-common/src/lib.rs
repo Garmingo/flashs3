@@ -8,6 +8,7 @@
 
 mod acl;
 mod cache;
+mod cors;
 mod env;
 mod error;
 mod identity;
@@ -16,6 +17,7 @@ mod version;
 
 pub use acl::*;
 pub use cache::*;
+pub use cors::*;
 pub use env::*;
 pub use error::*;
 pub use identity::*;

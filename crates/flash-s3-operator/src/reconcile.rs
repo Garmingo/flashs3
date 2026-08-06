@@ -7,7 +7,8 @@ use std::sync::Arc;
 
 use flash_s3_common::{
     ENV_ACCESS_KEY, ENV_CACHE_MAX_BYTES, ENV_CACHE_OBJECT_MAX_BYTES, ENV_CACHE_POLICY,
-    ENV_DATA_DIR, ENV_DEFAULT_BUCKET_NAME, ENV_DEFAULT_OBJECT_ACL, ENV_SECRET_KEY,
+    ENV_DATA_DIR, ENV_DEFAULT_BUCKET_CORS, ENV_DEFAULT_BUCKET_CORS_ALLOW_ALL,
+    ENV_DEFAULT_BUCKET_NAME, ENV_DEFAULT_OBJECT_ACL, ENV_SECRET_KEY,
 };
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec, DeploymentStrategy};
 use k8s_openapi::api::core::v1::{
@@ -46,6 +47,9 @@ pub enum Error {
     /// Catch-all for finalizer / apply failures.
     #[error("{0}")]
     Other(String),
+    /// Invalid CR combination (e.g. cors without defaultBucketName).
+    #[error("invalid FlashS3Bucket spec: {0}")]
+    InvalidSpec(String),
 }
 
 /// Controller entrypoint: apply or cleanup under a finalizer.
@@ -234,6 +238,29 @@ async fn ensure_deployment(
     ];
     if let Some(default_bucket_name) = &bucket.spec.default_bucket_name {
         container_env.push(env(ENV_DEFAULT_BUCKET_NAME, default_bucket_name));
+    }
+    if let Some(cors) = &bucket.spec.cors {
+        if bucket.spec.default_bucket_name.is_none() {
+            return Err(Error::InvalidSpec(
+                "spec.cors requires spec.defaultBucketName".into(),
+            ));
+        }
+        if cors.allow_all && !cors.rules.is_empty() {
+            return Err(Error::InvalidSpec(
+                "spec.cors.allowAll cannot be combined with spec.cors.rules".into(),
+            ));
+        }
+        if cors.allow_all {
+            container_env.push(env(ENV_DEFAULT_BUCKET_CORS_ALLOW_ALL, "true"));
+        } else if cors.rules.is_empty() {
+            return Err(Error::InvalidSpec(
+                "spec.cors requires allowAll: true or at least one rule".into(),
+            ));
+        } else {
+            let cors_json = serde_json::to_string(cors)
+                .map_err(|e| Error::Other(format!("serialize cors: {e}")))?;
+            container_env.push(env(ENV_DEFAULT_BUCKET_CORS, &cors_json));
+        }
     }
     let deploy = Deployment {
         metadata: ObjectMeta {

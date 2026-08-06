@@ -1,7 +1,7 @@
 //! Path-style S3 request router and handlers.
 //!
 //! A single catch-all dispatches on HTTP method + query flags (`acl`, `policy`,
-//! `uploads`, `uploadId`, …) to keep Axum routing simple while covering the
+//! `cors`, `uploads`, `uploadId`, …) to keep Axum routing simple while covering the
 //! S3 API surface we implement.
 
 use std::collections::BTreeMap;
@@ -16,7 +16,8 @@ use base64::Engine;
 use bytes::{Bytes, BytesMut};
 use chrono::DateTime;
 use flash_s3_common::{
-    AccessControlPolicy, CannedAcl, FlashError, ObjectKey, Permission,
+    allowed_request_headers, AccessControlPolicy, CannedAcl, CorsConfiguration, CorsRule,
+    FlashError, ObjectKey, Permission,
 };
 use futures::{StreamExt, TryStreamExt};
 use md5::Digest as Md5Digest;
@@ -102,12 +103,28 @@ async fn dispatch(state: AppState, req: Request, path: Option<String>) -> Respon
     let headers = req.headers().clone();
 
     let resource = path.clone().unwrap_or_else(|| "/".into());
+    let bucket_for_cors = path.as_deref().and_then(|p| {
+        p.split('/')
+            .find(|segment| !segment.is_empty())
+            .map(str::to_string)
+    });
     let result =
-        dispatch_inner(state, method, uri, headers, req.into_body(), path, &request_id).await;
-    match result {
+        dispatch_inner(state.clone(), method.clone(), uri, headers.clone(), req.into_body(), path, &request_id).await;
+    let mut resp = match result {
         Ok(resp) => resp,
         Err(err) => s3_error_response(err, &resource, &request_id),
+    };
+
+    // OPTIONS responses already carry CORS headers from the preflight handler.
+    if method != Method::OPTIONS {
+        if let (Some(bucket), Some(origin)) = (
+            bucket_for_cors.as_deref(),
+            headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()),
+        ) {
+            maybe_apply_cors_headers(&state, bucket, method.as_str(), origin, &mut resp).await;
+        }
     }
+    resp
 }
 
 async fn dispatch_inner(
@@ -403,6 +420,12 @@ async fn bucket_ops(
     body: &Bytes,
     request_id: &str,
 ) -> Result<Response, FlashError> {
+    if *method == Method::OPTIONS {
+        return handle_options_cors(state, bucket, headers, request_id).await;
+    }
+    if query.contains_key("cors") {
+        return bucket_cors_ops(state, ctx, method, bucket, body, request_id).await;
+    }
     if query.contains_key("policy") {
         return bucket_policy_ops(state, ctx, method, bucket, body, request_id).await;
     }
@@ -589,6 +612,73 @@ async fn bucket_policy_ops(
     }
 }
 
+async fn bucket_cors_ops(
+    state: &AppState,
+    ctx: &AuthContext,
+    method: &Method,
+    bucket: &str,
+    body: &Bytes,
+    request_id: &str,
+) -> Result<Response, FlashError> {
+    let info = state.store.get_bucket(bucket).await?;
+    let policy = state.store.load_policy(bucket).await?;
+    match *method {
+        Method::GET => {
+            state.authorizer.authorize(
+                ctx,
+                S3Action::GetBucketCors,
+                Some(&info),
+                None,
+                policy.as_ref(),
+            )?;
+            let raw = state.store.get_bucket_cors(bucket).await?;
+            state
+                .metrics
+                .s3_requests
+                .with_label_values(&["GET", "200", "GetBucketCors"])
+                .inc();
+            Ok(xml_ok(raw, request_id))
+        }
+        Method::PUT => {
+            state.authorizer.authorize(
+                ctx,
+                S3Action::PutBucketCors,
+                Some(&info),
+                None,
+                policy.as_ref(),
+            )?;
+            let raw = std::str::from_utf8(body)
+                .map_err(|_| FlashError::MalformedCORSConfiguration)?;
+            let cors = xml::parse_cors_xml(raw)?;
+            let canonical = xml::cors_xml(&cors);
+            state.store.put_bucket_cors(bucket, &canonical).await?;
+            state
+                .metrics
+                .s3_requests
+                .with_label_values(&["PUT", "200", "PutBucketCors"])
+                .inc();
+            Ok(StatusCode::OK.into_response())
+        }
+        Method::DELETE => {
+            state.authorizer.authorize(
+                ctx,
+                S3Action::DeleteBucketCors,
+                Some(&info),
+                None,
+                policy.as_ref(),
+            )?;
+            state.store.delete_bucket_cors(bucket).await?;
+            state
+                .metrics
+                .s3_requests
+                .with_label_values(&["DELETE", "204", "DeleteBucketCors"])
+                .inc();
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+        _ => Err(FlashError::InvalidRequest("bad cors method".into())),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn object_ops(
     state: &AppState,
@@ -601,6 +691,9 @@ async fn object_ops(
     body: Bytes,
     request_id: &str,
 ) -> Result<Response, FlashError> {
+    if *method == Method::OPTIONS {
+        return handle_options_cors(state, bucket, headers, request_id).await;
+    }
     // Multipart
     if query.contains_key("uploads") && *method == Method::POST {
         return create_multipart(state, ctx, bucket, key, headers, request_id).await;
@@ -1385,6 +1478,142 @@ fn etag_ok(etag: &str, request_id: &str) -> Response {
         )
         .body(Body::empty())
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+async fn load_bucket_cors(
+    state: &AppState,
+    bucket: &str,
+) -> Result<Option<CorsConfiguration>, FlashError> {
+    match state.store.load_cors_raw(bucket).await? {
+        Some(raw) => Ok(Some(xml::parse_cors_xml(&raw)?)),
+        None => Ok(None),
+    }
+}
+
+/// Browser CORS preflight (`OPTIONS`) against a bucket/object path.
+///
+/// Does not require SigV4; evaluates the bucket CORS configuration only.
+async fn handle_options_cors(
+    state: &AppState,
+    bucket: &str,
+    headers: &HeaderMap,
+    request_id: &str,
+) -> Result<Response, FlashError> {
+    let _ = state.store.get_bucket(bucket).await?;
+    let cors = load_bucket_cors(state, bucket).await?;
+    let Some(cors) = cors else {
+        return Err(FlashError::AccessDenied);
+    };
+
+    let origin = headers
+        .get(header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .ok_or(FlashError::AccessDenied)?;
+    let req_method = headers
+        .get("access-control-request-method")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| {
+            FlashError::InvalidRequest("missing Access-Control-Request-Method".into())
+        })?;
+    let req_headers = headers
+        .get("access-control-request-headers")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    let rule = cors
+        .find_matching_rule(origin, req_method, req_headers)
+        .ok_or(FlashError::AccessDenied)?;
+
+    state
+        .metrics
+        .s3_requests
+        .with_label_values(&["OPTIONS", "200", "CORSPreflight"])
+        .inc();
+    Ok(preflight_response(rule, origin, req_method, req_headers, request_id))
+}
+
+fn preflight_response(
+    rule: &CorsRule,
+    origin: &str,
+    req_method: &str,
+    req_headers: &str,
+    request_id: &str,
+) -> Response {
+    let allow_origin = rule.allow_origin_value(origin);
+    let allow_methods = req_method.to_ascii_uppercase();
+    let allow_headers = allowed_request_headers(&rule.allowed_headers, req_headers);
+    let expose = rule.expose_headers.join(",");
+    let max_age = rule.max_age_seconds.map(|v| v.to_string());
+
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header(
+            HeaderName::from_static("x-amz-request-id"),
+            HeaderValue::from_str(request_id).unwrap_or_else(|_| HeaderValue::from_static("")),
+        )
+        .header(
+            header::VARY,
+            "Origin, Access-Control-Request-Headers, Access-Control-Request-Method",
+        )
+        .header(
+            HeaderName::from_static("access-control-allow-origin"),
+            allow_origin,
+        )
+        .header(
+            HeaderName::from_static("access-control-allow-methods"),
+            allow_methods,
+        );
+
+    if !allow_headers.is_empty() {
+        builder = builder.header(
+            HeaderName::from_static("access-control-allow-headers"),
+            allow_headers.join(","),
+        );
+    }
+    if !expose.is_empty() {
+        builder = builder.header(
+            HeaderName::from_static("access-control-expose-headers"),
+            expose,
+        );
+    }
+    if let Some(max_age) = max_age {
+        builder = builder.header(HeaderName::from_static("access-control-max-age"), max_age);
+    }
+
+    builder
+        .body(Body::empty())
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+async fn maybe_apply_cors_headers(
+    state: &AppState,
+    bucket: &str,
+    method: &str,
+    origin: &str,
+    resp: &mut Response,
+) {
+    let Ok(Some(cors)) = load_bucket_cors(state, bucket).await else {
+        return;
+    };
+    let Some(rule) = cors.find_matching_rule(origin, method, "") else {
+        return;
+    };
+    let headers = resp.headers_mut();
+    if let Ok(value) = HeaderValue::from_str(&rule.allow_origin_value(origin)) {
+        headers.insert(
+            HeaderName::from_static("access-control-allow-origin"),
+            value,
+        );
+    }
+    if !rule.expose_headers.is_empty() {
+        if let Ok(value) = HeaderValue::from_str(&rule.expose_headers.join(",")) {
+            headers.insert(
+                HeaderName::from_static("access-control-expose-headers"),
+                value,
+            );
+        }
+    }
+    headers.insert(header::VARY, HeaderValue::from_static("Origin"));
 }
 
 fn parse_query(q: &str) -> BTreeMap<String, String> {

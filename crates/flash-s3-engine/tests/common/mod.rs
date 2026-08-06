@@ -40,6 +40,8 @@ pub fn test_config(data_dir: PathBuf) -> Config {
         auth_required: false,
         default_object_acl: "private".into(),
         default_bucket_name: None,
+        default_bucket_cors: None,
+        default_bucket_cors_allow_all: false,
         root_bypasses_acl: true,
     }
 }
@@ -159,14 +161,25 @@ pub async fn anon_request(
     method: Method,
     path: &str,
 ) -> (StatusCode, Bytes) {
-    let req = Request::builder()
-        .method(method)
-        .uri(path)
-        .body(Body::empty())
-        .unwrap();
+    let (status, _, body) = anon_request_with_headers(state, method, path, &[]).await;
+    (status, body)
+}
+
+pub async fn anon_request_with_headers(
+    state: &AppState,
+    method: Method,
+    path: &str,
+    headers: &[(&str, &str)],
+) -> (StatusCode, http::HeaderMap, Bytes) {
+    let mut builder = Request::builder().method(method).uri(path);
+    for (k, v) in headers {
+        builder = builder.header(*k, *v);
+    }
+    let req = builder.body(Body::empty()).unwrap();
     let app = router(state.clone());
     let resp = app.oneshot(req).await.expect("response");
     let status = resp.status();
+    let resp_headers = resp.headers().clone();
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-    (status, bytes)
+    (status, resp_headers, bytes)
 }

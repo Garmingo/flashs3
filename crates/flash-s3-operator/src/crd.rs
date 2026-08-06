@@ -36,6 +36,13 @@ pub struct FlashS3BucketSpec {
     /// Optional S3 bucket created automatically when the engine starts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_bucket_name: Option<String>,
+    /// Optional CORS applied to [`Self::default_bucket_name`] on engine startup.
+    ///
+    /// Requires `defaultBucketName`. Use `allowAll: true` for a permissive
+    /// local/dev policy, or set explicit `rules`. Mapped to
+    /// `FLASHS3_DEFAULT_BUCKET_CORS` / `FLASHS3_DEFAULT_BUCKET_CORS_ALLOW_ALL`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cors: Option<CorsSpec>,
     /// Cache settings mapped to `FLASHS3_CACHE_*` env vars.
     #[serde(default)]
     pub cache: CacheSpec,
@@ -55,6 +62,42 @@ fn default_acl() -> String {
 }
 fn default_true() -> bool {
     true
+}
+
+/// Bucket CORS configuration applied on engine startup.
+#[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CorsSpec {
+    /// When true, allow any origin/method/header (local/dev convenience).
+    ///
+    /// Mutually exclusive with [`Self::rules`].
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_all: bool,
+    /// Ordered CORS rules (first match wins, matching AWS S3).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rules: Vec<CorsRuleSpec>,
+}
+
+/// One CORS rule (S3 `CORSRule`).
+#[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CorsRuleSpec {
+    /// Optional rule id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// Allowed origins (`*` or exact / wildcard URL).
+    pub allowed_origins: Vec<String>,
+    /// Allowed methods (`GET`, `PUT`, `HEAD`, `POST`, `DELETE`).
+    pub allowed_methods: Vec<String>,
+    /// Allowed request headers for preflight (`*` for all).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_headers: Vec<String>,
+    /// Response headers exposed to browser JavaScript.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expose_headers: Vec<String>,
+    /// Preflight cache lifetime in seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_age_seconds: Option<u32>,
 }
 
 /// Authentication configuration for the engine pod.

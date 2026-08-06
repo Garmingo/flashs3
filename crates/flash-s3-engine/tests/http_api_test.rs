@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use bytes::Bytes;
 use chrono::DateTime;
 use flash_s3_engine::api::router;
-use common::{anon_request, app_state, sign_headers, signed_request};
+use common::{anon_request, anon_request_with_headers, app_state, sign_headers, signed_request};
 use axum::body::Body;
 use http::{Method, Request, StatusCode};
 use tower::ServiceExt;
@@ -36,6 +36,68 @@ async fn configured_default_bucket_is_created_idempotently() {
 
     let bucket = state.store.get_bucket("bootstrap").await.unwrap();
     assert_eq!(bucket.name, "bootstrap");
+}
+
+#[tokio::test]
+async fn configured_default_bucket_applies_cors() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = common::test_config(tmp.path().to_path_buf());
+    config.default_bucket_name = Some("cors-boot".into());
+    config.default_bucket_cors = Some(
+        r#"{"rules":[{"allowedOrigins":["http://localhost:3001"],"allowedMethods":["PUT","GET","HEAD"],"allowedHeaders":["*"],"maxAgeSeconds":3000}]}"#
+            .into(),
+    );
+    let state = flash_s3_engine::AppState::new(config).unwrap();
+    state.initialize_default_bucket().await.unwrap();
+
+    let raw = state.store.get_bucket_cors("cors-boot").await.unwrap();
+    assert!(raw.contains("http://localhost:3001"));
+    assert!(raw.contains("<AllowedMethod>PUT</AllowedMethod>"));
+
+    let (status, headers, _) = anon_request_with_headers(
+        &state,
+        Method::OPTIONS,
+        "/cors-boot/upload.bin",
+        &[
+            ("Origin", "http://localhost:3001"),
+            ("Access-Control-Request-Method", "PUT"),
+            ("Access-Control-Request-Headers", "content-type"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers.get("access-control-allow-origin").unwrap(),
+        "http://localhost:3001"
+    );
+}
+
+#[tokio::test]
+async fn configured_default_bucket_cors_allow_all() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = common::test_config(tmp.path().to_path_buf());
+    config.default_bucket_name = Some("cors-all".into());
+    config.default_bucket_cors_allow_all = true;
+    let state = flash_s3_engine::AppState::new(config).unwrap();
+    state.initialize_default_bucket().await.unwrap();
+
+    let raw = state.store.get_bucket_cors("cors-all").await.unwrap();
+    assert!(raw.contains("<AllowedOrigin>*</AllowedOrigin>"));
+
+    let (status, headers, _) = anon_request_with_headers(
+        &state,
+        Method::OPTIONS,
+        "/cors-all/upload.bin",
+        &[
+            ("Origin", "http://localhost:3001"),
+            ("Access-Control-Request-Method", "PUT"),
+            ("Access-Control-Request-Headers", "content-type"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers.get("access-control-allow-origin").unwrap(), "*");
+    assert_eq!(headers.get("access-control-allow-methods").unwrap(), "PUT");
 }
 
 #[tokio::test]
@@ -621,4 +683,265 @@ async fn metrics_endpoint() {
     let text = String::from_utf8_lossy(&body);
     assert!(text.contains("flashs3_cache_hits_total"));
     assert!(text.contains("flashs3_s3_requests_total") || text.contains("flashs3_cache_bytes"));
+}
+
+const DEV_CORS_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<CORSConfiguration>
+  <CORSRule>
+    <AllowedOrigin>http://localhost:3001</AllowedOrigin>
+    <AllowedMethod>PUT</AllowedMethod>
+    <AllowedMethod>GET</AllowedMethod>
+    <AllowedMethod>HEAD</AllowedMethod>
+    <AllowedHeader>*</AllowedHeader>
+    <ExposeHeader>ETag</ExposeHeader>
+    <ExposeHeader>x-amz-request-id</ExposeHeader>
+    <MaxAgeSeconds>3000</MaxAgeSeconds>
+  </CORSRule>
+</CORSConfiguration>"#;
+
+#[tokio::test]
+async fn bucket_cors_crud() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = app_state(&tmp);
+    signed_request(
+        &state,
+        Method::PUT,
+        "/cors-bucket",
+        BTreeMap::new(),
+        Bytes::new(),
+        &[],
+    )
+    .await;
+
+    let mut q = BTreeMap::new();
+    q.insert("cors".into(), String::new());
+
+    let (status, _, body) = signed_request(
+        &state,
+        Method::GET,
+        "/cors-bucket",
+        q.clone(),
+        Bytes::new(),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(String::from_utf8_lossy(&body).contains("NoSuchCORSConfiguration"));
+
+    let (status, _, _) = signed_request(
+        &state,
+        Method::PUT,
+        "/cors-bucket",
+        q.clone(),
+        Bytes::from(DEV_CORS_XML),
+        &[("content-type", "application/xml")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _, body) = signed_request(
+        &state,
+        Method::GET,
+        "/cors-bucket",
+        q.clone(),
+        Bytes::new(),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("http://localhost:3001"));
+    assert!(text.contains("<AllowedMethod>PUT</AllowedMethod>"));
+    assert!(text.contains("<AllowedHeader>*</AllowedHeader>"));
+
+    let (status, _, _) = signed_request(
+        &state,
+        Method::DELETE,
+        "/cors-bucket",
+        q.clone(),
+        Bytes::new(),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (status, _, _) = signed_request(
+        &state,
+        Method::GET,
+        "/cors-bucket",
+        q,
+        Bytes::new(),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn cors_preflight_and_put_headers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = app_state(&tmp);
+    signed_request(
+        &state,
+        Method::PUT,
+        "/cors-upload",
+        BTreeMap::new(),
+        Bytes::new(),
+        &[],
+    )
+    .await;
+
+    // Without CORS config: OPTIONS is denied (no Access-Control-* headers).
+    let (status, headers, body) = anon_request_with_headers(
+        &state,
+        Method::OPTIONS,
+        "/cors-upload/key.bin",
+        &[
+            ("Origin", "http://localhost:3001"),
+            ("Access-Control-Request-Method", "PUT"),
+            ("Access-Control-Request-Headers", "content-type"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(headers.get("access-control-allow-origin").is_none());
+    let _ = body;
+
+    let mut q = BTreeMap::new();
+    q.insert("cors".into(), String::new());
+    let (status, _, _) = signed_request(
+        &state,
+        Method::PUT,
+        "/cors-upload",
+        q,
+        Bytes::from(DEV_CORS_XML),
+        &[("content-type", "application/xml")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, headers, _) = anon_request_with_headers(
+        &state,
+        Method::OPTIONS,
+        "/cors-upload/key.bin",
+        &[
+            ("Origin", "http://localhost:3001"),
+            ("Access-Control-Request-Method", "PUT"),
+            ("Access-Control-Request-Headers", "content-type"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers.get("access-control-allow-origin").unwrap(),
+        "http://localhost:3001"
+    );
+    assert_eq!(
+        headers.get("access-control-allow-methods").unwrap(),
+        "PUT"
+    );
+    assert!(headers
+        .get("access-control-allow-headers")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_ascii_lowercase()
+        .contains("content-type"));
+    assert_eq!(headers.get("access-control-max-age").unwrap(), "3000");
+
+    // Disallowed origin must not get CORS success headers.
+    let (status, headers, _) = anon_request_with_headers(
+        &state,
+        Method::OPTIONS,
+        "/cors-upload/key.bin",
+        &[
+            ("Origin", "http://evil.example"),
+            ("Access-Control-Request-Method", "PUT"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(headers.get("access-control-allow-origin").is_none());
+
+    let (status, headers, _) = signed_request(
+        &state,
+        Method::PUT,
+        "/cors-upload/key.bin",
+        BTreeMap::new(),
+        Bytes::from_static(b"browser-upload"),
+        &[
+            ("content-type", "application/octet-stream"),
+            ("Origin", "http://localhost:3001"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers.get("access-control-allow-origin").unwrap(),
+        "http://localhost:3001"
+    );
+    let expose = headers
+        .get("access-control-expose-headers")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(expose.contains("ETag"));
+
+    let (status, headers, _) = signed_request(
+        &state,
+        Method::GET,
+        "/cors-upload/key.bin",
+        BTreeMap::new(),
+        Bytes::new(),
+        &[("Origin", "http://localhost:3001")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers.get("access-control-allow-origin").unwrap(),
+        "http://localhost:3001"
+    );
+
+    let (status, headers, _) = signed_request(
+        &state,
+        Method::HEAD,
+        "/cors-upload/key.bin",
+        BTreeMap::new(),
+        Bytes::new(),
+        &[("Origin", "http://localhost:3001")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers.get("access-control-allow-origin").unwrap(),
+        "http://localhost:3001"
+    );
+}
+
+#[tokio::test]
+async fn cors_malformed_put_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = app_state(&tmp);
+    signed_request(
+        &state,
+        Method::PUT,
+        "/bad-cors",
+        BTreeMap::new(),
+        Bytes::new(),
+        &[],
+    )
+    .await;
+    let mut q = BTreeMap::new();
+    q.insert("cors".into(), String::new());
+    let (status, _, body) = signed_request(
+        &state,
+        Method::PUT,
+        "/bad-cors",
+        q,
+        Bytes::from_static(b"<CORSConfiguration></CORSConfiguration>"),
+        &[("content-type", "application/xml")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(String::from_utf8_lossy(&body).contains("MalformedXML"));
 }

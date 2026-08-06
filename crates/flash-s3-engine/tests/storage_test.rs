@@ -328,3 +328,24 @@ async fn bucket_policy_roundtrip() {
         Some(true)
     );
 }
+
+#[tokio::test]
+async fn bucket_cors_roundtrip() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = ObjectStore::open(tmp.path().to_path_buf(), Metrics::new().unwrap()).unwrap();
+    let owner = CanonicalUserId::new("o1");
+    store
+        .create_bucket("cors", owner, "root", CannedAcl::Private)
+        .await
+        .unwrap();
+    let raw = r#"<?xml version="1.0" encoding="UTF-8"?><CORSConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><CORSRule><AllowedOrigin>http://localhost:3001</AllowedOrigin><AllowedMethod>PUT</AllowedMethod><AllowedMethod>GET</AllowedMethod><AllowedHeader>*</AllowedHeader><MaxAgeSeconds>3000</MaxAgeSeconds></CORSRule></CORSConfiguration>"#;
+    store.put_bucket_cors("cors", raw).await.unwrap();
+    assert_eq!(store.get_bucket_cors("cors").await.unwrap(), raw);
+    let loaded = store.load_cors_raw("cors").await.unwrap().unwrap();
+    assert!(loaded.contains("localhost:3001"));
+    store.delete_bucket_cors("cors").await.unwrap();
+    assert!(matches!(
+        store.get_bucket_cors("cors").await,
+        Err(FlashError::NoSuchCORSConfiguration)
+    ));
+}

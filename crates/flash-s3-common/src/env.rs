@@ -30,6 +30,18 @@ pub const ENV_AUTH_REQUIRED: &str = "FLASHS3_AUTH_REQUIRED";
 pub const ENV_DEFAULT_OBJECT_ACL: &str = "FLASHS3_DEFAULT_OBJECT_ACL";
 /// Optional S3 bucket created idempotently when the engine starts.
 pub const ENV_DEFAULT_BUCKET_NAME: &str = "FLASHS3_DEFAULT_BUCKET_NAME";
+/// Optional camelCase JSON CORS config applied to the default bucket on startup.
+///
+/// Example:
+/// `{"rules":[{"allowedOrigins":["http://localhost:3001"],"allowedMethods":["PUT","GET","HEAD"],"allowedHeaders":["*"]}]}`
+///
+/// Or the lazy/dev form `{"allowAll":true}`.
+pub const ENV_DEFAULT_BUCKET_CORS: &str = "FLASHS3_DEFAULT_BUCKET_CORS";
+/// When `true`/`1`/`yes`, apply a permissive `*` CORS config to the default bucket.
+///
+/// Convenience for local Docker/dev; equivalent to `FLASHS3_DEFAULT_BUCKET_CORS={"allowAll":true}`.
+/// Requires [`ENV_DEFAULT_BUCKET_NAME`]. Takes precedence over [`ENV_DEFAULT_BUCKET_CORS`].
+pub const ENV_DEFAULT_BUCKET_CORS_ALLOW_ALL: &str = "FLASHS3_DEFAULT_BUCKET_CORS_ALLOW_ALL";
 /// When true, root API keys bypass ACL/policy checks (break-glass admin).
 pub const ENV_ROOT_BYPASSES_ACL: &str = "FLASHS3_ROOT_BYPASSES_ACL";
 

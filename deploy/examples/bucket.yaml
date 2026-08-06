@@ -10,6 +10,16 @@ spec:
   # Created automatically on engine startup.
   defaultBucketName: media-assets
   defaultObjectAcl: private
+  # Applied to defaultBucketName on every engine start (browser uploads / CDN).
+  # Dev shortcut: cors: { allowAll: true }
+  cors:
+    rules:
+      - allowedOrigins:
+          - http://localhost:3001
+        allowedMethods: [PUT, GET, HEAD]
+        allowedHeaders: ["*"]
+        exposeHeaders: [ETag, x-amz-request-id]
+        maxAgeSeconds: 3000
   cache:
     policy: InMemoryLRU
     maxSizeInBytes: 2147483648

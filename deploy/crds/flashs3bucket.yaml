@@ -55,6 +55,50 @@ spec:
                   enum: [private, public-read, public-read-write, authenticated-read]
                 defaultBucketName:
                   type: string
+                cors:
+                  type: object
+                  description: >-
+                    Optional CORS configuration applied to defaultBucketName on
+                    engine startup (requires defaultBucketName). Set allowAll
+                    for a permissive local/dev policy, or provide explicit rules.
+                  properties:
+                    allowAll:
+                      type: boolean
+                      default: false
+                      description: >-
+                        Allow any origin, method, and header. Mutually exclusive
+                        with rules. Prefer explicit rules in production.
+                    rules:
+                      type: array
+                      minItems: 1
+                      items:
+                        type: object
+                        required: [allowedOrigins, allowedMethods]
+                        properties:
+                          id:
+                            type: string
+                          allowedOrigins:
+                            type: array
+                            minItems: 1
+                            items:
+                              type: string
+                          allowedMethods:
+                            type: array
+                            minItems: 1
+                            items:
+                              type: string
+                              enum: [GET, PUT, HEAD, POST, DELETE]
+                          allowedHeaders:
+                            type: array
+                            items:
+                              type: string
+                          exposeHeaders:
+                            type: array
+                            items:
+                              type: string
+                          maxAgeSeconds:
+                            type: integer
+                            minimum: 0
                 cache:
                   type: object
                   properties:

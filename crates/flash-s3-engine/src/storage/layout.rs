@@ -58,6 +58,11 @@ pub fn bucket_policy_path(data_dir: &Path, bucket: &str) -> PathBuf {
     bucket_dir(data_dir, bucket).join("policy.json")
 }
 
+/// Optional bucket CORS configuration XML file.
+pub fn bucket_cors_path(data_dir: &Path, bucket: &str) -> PathBuf {
+    bucket_dir(data_dir, bucket).join("cors.xml")
+}
+
 /// Multipart staging directory for one upload id.
 pub fn multipart_dir(data_dir: &Path, bucket: &str, upload_id: &str) -> PathBuf {
     bucket_dir(data_dir, bucket)
