@@ -638,6 +638,17 @@ pub fn parse_complete_multipart(xml: &str) -> Result<Vec<(i32, String)>, flash_s
     Ok(parts)
 }
 
+/// `PostResponse` body for `success_action_status` 200/201.
+pub fn post_response_xml(location: &str, bucket: &str, key: &str, etag: &str) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?><PostResponse><Location>{}</Location><Bucket>{}</Bucket><Key>{}</Key><ETag>{}</ETag></PostResponse>"#,
+        xml_escape(location),
+        xml_escape(bucket),
+        xml_escape(key),
+        xml_escape(etag),
+    )
+}
+
 // silence unused warning for GroupUri import usage in string compare
 #[allow(dead_code)]
 fn _uri() -> &'static str {

@@ -156,6 +156,24 @@ async fn dispatch_inner(
         return handle_options_cors(&state, bucket, &headers, request_id).await;
     }
 
+    let (bucket_pre, key_pre) = resolve_bucket_key(&state, &headers, path.as_deref());
+    if crate::api::post_object::is_post_object_upload(
+        &method,
+        key_pre.is_some(),
+        &query_map,
+        &headers,
+    ) {
+        let bucket = bucket_pre.ok_or_else(|| FlashError::InvalidRequest("missing bucket".into()))?;
+        return crate::api::post_object::handle_post_object(
+            state,
+            bucket,
+            headers,
+            body,
+            request_id,
+        )
+        .await;
+    }
+
     let has_object_key = path
         .as_deref()
         .map(|p| p.split('/').filter(|segment| !segment.is_empty()).count() > 1)
@@ -718,6 +736,10 @@ async fn bucket_ops(
                 return Err(FlashError::AccessDenied);
             }
             let owner = ctx.key.as_ref().unwrap();
+            let canned_acl = headers
+                .get("x-amz-acl")
+                .and_then(|v| v.to_str().ok())
+                .and_then(CannedAcl::parse);
             let info = state
                 .store
                 .create_bucket(
@@ -727,6 +749,14 @@ async fn bucket_ops(
                     state.config.default_object_acl(),
                 )
                 .await?;
+            if let Some(acl) = canned_acl {
+                let bucket_acl = AccessControlPolicy::from_canned(
+                    owner.canonical_id.clone(),
+                    &owner.display_name,
+                    acl,
+                );
+                state.store.put_bucket_acl(bucket, bucket_acl).await?;
+            }
             let _ = info;
             state.metrics.s3_requests.with_label_values(&["PUT", "200", "CreateBucket"]).inc();
             Ok(etag_ok("", request_id))
