@@ -5,6 +5,7 @@
 
 mod aws_chunked;
 mod error;
+mod post_object;
 mod router;
 mod xml;
 

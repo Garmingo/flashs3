@@ -49,6 +49,7 @@ tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 url = { workspace = true }
 urlencoding = { workspace = true }
+multer = "3"
 tempfile = { workspace = true }
 async-trait = { workspace = true }
 

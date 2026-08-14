@@ -7,7 +7,11 @@
 
 mod authorize;
 mod credentials;
+mod post_policy;
 mod sigv4;
+
+pub(crate) use post_policy::{verify_anonymous_post_allowed, verify_post_policy, PostFormFields};
+pub(crate) use post_policy::resolve_post_object_key;
 
 pub use authorize::{AuthContext, Authorizer, S3Action};
 pub use credentials::{CredentialStore, StoredKey};

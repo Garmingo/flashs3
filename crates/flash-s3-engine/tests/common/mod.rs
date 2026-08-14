@@ -108,7 +108,7 @@ pub fn sign_headers(
     ]
 }
 
-fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
+pub fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
     let mut mac = HmacSha256::new_from_slice(key).unwrap();
     mac.update(data);
     mac.finalize().into_bytes().to_vec()
@@ -336,4 +336,113 @@ pub async fn presigned_request(
     let resp_headers = resp.headers().clone();
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     (status, resp_headers, bytes)
+}
+
+/// Build base64 POST policy JSON (SigV4) and sign it.
+pub fn build_signed_post_fields_v4(
+    bucket: &str,
+    key: &str,
+    content_type: Option<&str>,
+    min_size: u64,
+    max_size: u64,
+    extra_conditions: Vec<serde_json::Value>,
+) -> BTreeMap<String, String> {
+    use base64::Engine;
+    use chrono::Utc;
+
+    let now = Utc::now();
+    let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
+    let date = now.format("%Y%m%d").to_string();
+    let expiration = (now + chrono::Duration::hours(1))
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
+    let credential = format!("{ACCESS}/{date}/{REGION}/s3/aws4_request");
+
+    let mut conditions = vec![
+        serde_json::json!({"bucket": bucket}),
+        serde_json::json!({"key": key}),
+        serde_json::json!({"x-amz-algorithm": "AWS4-HMAC-SHA256"}),
+        serde_json::json!({"x-amz-credential": credential.clone()}),
+        serde_json::json!({"x-amz-date": amz_date.clone()}),
+        serde_json::json!(["content-length-range", min_size, max_size]),
+    ];
+    if let Some(ct) = content_type {
+        conditions.push(serde_json::json!({"Content-Type": ct}));
+    }
+    conditions.extend(extra_conditions);
+
+    let policy_doc = serde_json::json!({
+        "expiration": expiration,
+        "conditions": conditions,
+    });
+    let policy_json = serde_json::to_string(&policy_doc).unwrap();
+    let policy_b64 = base64::engine::general_purpose::STANDARD.encode(policy_json.as_bytes());
+
+    let k_date = hmac_sha256(format!("AWS4{SECRET}").as_bytes(), date.as_bytes());
+    let k_region = hmac_sha256(&k_date, REGION.as_bytes());
+    let k_service = hmac_sha256(&k_region, b"s3");
+    let k_signing = hmac_sha256(&k_service, b"aws4_request");
+    let signature = hex::encode(hmac_sha256(&k_signing, policy_b64.as_bytes()));
+
+    let mut fields = BTreeMap::new();
+    fields.insert("key".into(), key.into());
+    fields.insert("policy".into(), policy_b64);
+    fields.insert("x-amz-algorithm".into(), "AWS4-HMAC-SHA256".into());
+    fields.insert("x-amz-credential".into(), credential);
+    fields.insert("x-amz-date".into(), amz_date);
+    fields.insert("x-amz-signature".into(), signature);
+    if let Some(ct) = content_type {
+        fields.insert("Content-Type".into(), ct.into());
+    }
+    fields
+}
+
+/// Perform a multipart POST object upload to `path` (e.g. `/uploads`).
+pub async fn multipart_post_request(
+    state: &AppState,
+    path: &str,
+    fields: &BTreeMap<String, String>,
+    file_field: &str,
+    file_name: &str,
+    file_content_type: &str,
+    file_body: &[u8],
+) -> (StatusCode, http::HeaderMap, Bytes) {
+    let boundary = "----FlashS3TestBoundary";
+    let mut body = Vec::new();
+    for (name, value) in fields {
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(
+            format!("Content-Disposition: form-data; name=\"{name}\"\r\n\r\n").as_bytes(),
+        );
+        body.extend_from_slice(value.as_bytes());
+        body.extend_from_slice(b"\r\n");
+    }
+    body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+    body.extend_from_slice(
+        format!(
+            "Content-Disposition: form-data; name=\"{file_field}\"; filename=\"{file_name}\"\r\n"
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(format!("Content-Type: {file_content_type}\r\n\r\n").as_bytes());
+    body.extend_from_slice(file_body);
+    body.extend_from_slice(b"\r\n");
+    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(path)
+        .header(
+            "content-type",
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .header("host", "127.0.0.1:9000")
+        .body(Body::from(body))
+        .unwrap();
+    let app = router(state.clone());
+    let resp = app.oneshot(req).await.expect("response");
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, headers, bytes)
 }
