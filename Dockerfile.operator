@@ -1,6 +1,6 @@
 # FlashS3 operator image
 #
-# VERSION is set by GitLab CI from $CI_COMMIT_TAG (e.g. v0.2.0). The leading
+# VERSION is set by the GitHub Actions release workflow from the tag (e.g. v0.2.0). The leading
 # `v` is stripped so Cargo gets a semver package version.
 FROM rust:1.93-bookworm AS builder
 WORKDIR /app
