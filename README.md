@@ -76,7 +76,7 @@ Ops endpoints: `/healthz`, `/readyz`, `/metrics`.
 
 ## Container images
 
-Release tags trigger GitLab CI (Kaniko), which publishes two public images to Docker Hub:
+Release tags trigger the GitHub Actions `Release` workflow (`.github/workflows/release.yml`), which publishes two public images to Docker Hub:
 
 | Image | Path |
 |-------|------|
